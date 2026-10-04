@@ -7,7 +7,7 @@ import {spawnSync} from 'node:child_process';
 import assert from 'node:assert/strict';
 import adapter from '../adapters/pi.ts';
 const root=resolve('.'), temp=mkdtempSync(join(tmpdir(),'tongle-receipts-')), home=join(temp,'home');
-const python=process.env.PYTHON_EXECUTABLE || '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3';
+const python=process.env.PYTHON_EXECUTABLE || spawnSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', 'import sys; print(sys.executable)'], {encoding:'utf8'}).stdout.trim();
 process.env.TONGLE_NEXT_HOME=home; process.env.TONGLE_NEXT_ROOT=root;
 process.env.TONGLE_NEXT_PROJECT='probe'; process.env.TONGLE_NEXT_PYTHON=python;
 delete process.env.TONGLE_NEXT_CLI;
@@ -17,7 +17,7 @@ let callbacks={},branch=[];
 function install(){callbacks={};adapter({on:(n,f)=>callbacks[n]=f});}
 const ctx={cwd:join(temp,'workspace'),sessionManager:{getSessionId:()=> 'native-fixture',getLeafId:()=>branch.at(-1)?.id,getLeafEntry:()=>branch.at(-1),getBranch:()=>branch},hasUI:false,ui:{notify:()=>{}}};
 async function prompt(id){const parentId=branch.at(-1)?.id??null;const r=await callbacks.before_agent_start({prompt:'继续项目'},ctx);assert.ok(r?.message);branch.push({id,parentId,type:'message',message:{role:'user',content:[{type:'text',text:'继续项目'}]}});branch.push({id:'ctx-'+id,parentId:id,type:'custom_message',...r.message});return r.message.details.receiptId;}
-async function promptInsertedSystem(id){const anchor=branch.at(-1)?.id??null;const r=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(r?.message);const sysId='sys-'+id;branch.push({id:sysId,parentId:anchor,type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});branch.push({id,parentId:sysId,type:'message',message:{role:'user',content:[{type:'text',text:'真实顺序提问'}]}});branch.push({id:'ctx-'+id,parentId:id,type:'custom_message',...r.message});return r.message.details.receiptId;}
+async function promptInsertedSystem(id){const anchor=branch.at(-1)?.id??null;const r=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(r?.message);const sysId='sys-'+id;branch.push({id:sysId,parentId:anchor,type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});branch.push({id,parentId:sysId,type:'message',message:{role:'user',content:[{type:'text',text:'继续项目方案'}]}});branch.push({id:'ctx-'+id,parentId:id,type:'custom_message',...r.message});return r.message.details.receiptId;}
 async function answer(id,reason='stop'){await callbacks.message_end({message:{role:'assistant',responseId:id,stopReason:reason,content:[{type:'text',text:'本次只做方案。'}]}},ctx);}
 try{
  core(['init','--vault',join(temp,'vault'),'--evolving']);
@@ -43,9 +43,9 @@ try{
  // Actual installed Pi ordering: before_agent_start precedes user persistence,
  // then a system message is inserted before the user entry (nonroot anchor).
  const anchor=branch.at(-1).id;
- const r=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(r?.message);
+ const r=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(r?.message);
  branch.push({id:'sys-u4',parentId:anchor,type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});
- branch.push({id:'u4',parentId:'sys-u4',type:'message',message:{role:'user',content:[{type:'text',text:'真实顺序提问'}]}});
+ branch.push({id:'u4',parentId:'sys-u4',type:'message',message:{role:'user',content:[{type:'text',text:'继续项目方案'}]}});
  branch.push({id:'ctx-u4',parentId:'u4',type:'custom_message',...r.message});
  await answer('a5');assert.equal(rows().find(x=>x.id===r.message.details.receiptId).binding,'receipt');
  // Root-anchor variant: anchor null with only a system chain before the user.
@@ -54,56 +54,56 @@ try{
  await answer('a-root');
  assert.equal(rows().find(x=>x.id===rootCase).binding,'receipt');
  // Missing anchor equal to user parent (null previousEntryId) rejects.
- const missingAnchorR=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(missingAnchorR?.message);
- branch.push({id:'missing-anchor-user',parentId:branch.at(-1)?.id??null,type:'message',message:{role:'user',content:'真实顺序提问'}});
+ const missingAnchorR=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(missingAnchorR?.message);
+ branch.push({id:'missing-anchor-user',parentId:branch.at(-1)?.id??null,type:'message',message:{role:'user',content:'继续项目方案'}});
  branch.push({id:'ctx-missing-anchor',parentId:'missing-anchor-user',type:'custom_message',...missingAnchorR.message,details:{...missingAnchorR.message.details,previousEntryId:null}});
  await answer('a-missing-anchor');
  assert.equal(rows().find(x=>x.id===missingAnchorR.message.details.receiptId).output_source,null);
  // Missing details anchor (undefined previousEntryId) rejects.
- const undefAnchorR=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(undefAnchorR?.message);
- branch.push({id:'undef-anchor-user',parentId:branch.at(-1)?.id??null,type:'message',message:{role:'user',content:'真实顺序提问'}});
+ const undefAnchorR=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(undefAnchorR?.message);
+ branch.push({id:'undef-anchor-user',parentId:branch.at(-1)?.id??null,type:'message',message:{role:'user',content:'继续项目方案'}});
  branch.push({id:'ctx-undef-anchor',parentId:'undef-anchor-user',type:'custom_message',...undefAnchorR.message,details:{...undefAnchorR.message.details,previousEntryId:undefined}});
  await answer('a-undef-anchor');
  assert.equal(rows().find(x=>x.id===undefAnchorR.message.details.receiptId).output_source,null);
  // Intervening non-system node (assistant) between anchor and user rejects.
  const interAnchor=branch.at(-1).id;
- const interR=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(interR?.message);
+ const interR=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(interR?.message);
  branch.push({id:'sys-inter',parentId:interAnchor,type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});
  branch.push({id:'asst-inter',parentId:'sys-inter',type:'message',message:{role:'assistant',content:[{type:'text',text:'blah'}]}});
- branch.push({id:'u-inter',parentId:'asst-inter',type:'message',message:{role:'user',content:[{type:'text',text:'真实顺序提问'}]}});
+ branch.push({id:'u-inter',parentId:'asst-inter',type:'message',message:{role:'user',content:[{type:'text',text:'继续项目方案'}]}});
  branch.push({id:'ctx-inter',parentId:'u-inter',type:'custom_message',...interR.message});
  await answer('a-inter');
  assert.equal(rows().find(x=>x.id===interR.message.details.receiptId).output_source,null);
  // Intervening custom_message node (not a system message) rejects.
  const customAnchor=branch.at(-1).id;
- const customR=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(customR?.message);
+ const customR=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(customR?.message);
  branch.push({id:'sys-custom',parentId:customAnchor,type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});
  branch.push({id:'other-custom',parentId:'sys-custom',type:'custom_message',customType:'other',details:{}});
- branch.push({id:'u-custom',parentId:'other-custom',type:'message',message:{role:'user',content:[{type:'text',text:'真实顺序提问'}]}});
+ branch.push({id:'u-custom',parentId:'other-custom',type:'message',message:{role:'user',content:[{type:'text',text:'继续项目方案'}]}});
  branch.push({id:'ctx-custom',parentId:'u-custom',type:'custom_message',...customR.message});
  await answer('a-custom');
  assert.equal(rows().find(x=>x.id===customR.message.details.receiptId).output_source,null);
  // Missing system parent (non-null but unresolvable) rejects instead of binding.
  const missingParentAnchor=branch.at(-1).id;
- const missingParentR=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(missingParentR?.message);
+ const missingParentR=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(missingParentR?.message);
  branch.push({id:'sys-missing-parent',parentId:'does-not-exist',type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});
- branch.push({id:'u-missing-parent',parentId:'sys-missing-parent',type:'message',message:{role:'user',content:[{type:'text',text:'真实顺序提问'}]}});
+ branch.push({id:'u-missing-parent',parentId:'sys-missing-parent',type:'message',message:{role:'user',content:[{type:'text',text:'继续项目方案'}]}});
  branch.push({id:'ctx-missing-parent',parentId:'u-missing-parent',type:'custom_message',...missingParentR.message});
  await answer('a-missing-parent');
  assert.equal(rows().find(x=>x.id===missingParentR.message.details.receiptId).output_source,null);
  // Cycle in the parent chain rejects and must terminate traversal.
  const cycleAnchor=branch.at(-1).id;
- const cycleR=await callbacks.before_agent_start({prompt:'真实顺序提问'},ctx);assert.ok(cycleR?.message);
+ const cycleR=await callbacks.before_agent_start({prompt:'继续项目方案'},ctx);assert.ok(cycleR?.message);
  branch.push({id:'sys-cycle-a',parentId:'sys-cycle-b',type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});
  branch.push({id:'sys-cycle-b',parentId:'sys-cycle-a',type:'message',message:{role:'system',content:[{type:'text',text:'ok'}]}});
- branch.push({id:'u-cycle',parentId:'sys-cycle-a',type:'message',message:{role:'user',content:'真实顺序提问'}});
+ branch.push({id:'u-cycle',parentId:'sys-cycle-a',type:'message',message:{role:'user',content:'继续项目方案'}});
  branch.push({id:'ctx-cycle',parentId:'u-cycle',type:'custom_message',...cycleR.message});
  await answer('a-cycle');
  assert.equal(rows().find(x=>x.id===cycleR.message.details.receiptId).output_source,null);
  void missingParentAnchor; void cycleAnchor;
  // A changed anchor must not bind even when text matches.
  const wrong=core(['context','--project','probe','--session','native-fixture','--text','继续']).receipt_id;
- branch.push({id:'u5',parentId:'different',type:'message',message:{role:'user',content:'真实顺序提问'}});
+ branch.push({id:'u5',parentId:'different',type:'message',message:{role:'user',content:'继续项目方案'}});
  branch.push({id:'wrong-anchor',type:'custom_message',customType:'tongle-next-context',details:{...r.message.details,receiptId:wrong}});
  await answer('a6');assert.equal(rows().find(x=>x.id===wrong).output_source,null);
  // A same-text USER leaf is the previous turn, never the current one.
