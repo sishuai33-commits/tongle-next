@@ -1,0 +1,50 @@
+name: Preview build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+      - name: Platform and knowledge lifecycle regressions
+        run: >-
+          python -m unittest
+          tests.test_portability tests.test_process_portability
+          tests.test_product tests.test_http_model tests.test_guide
+          tests.test_evolution_consumer tests.test_evolving_backup
+          tests.test_knowledge_files_consumer tests.test_knowledge_store_consumer
+          tests.test_knowledge_dependencies tests.test_topic_synthesis_lifecycle
+          tests.test_learning tests.test_learning_lifecycle -q
+      - name: Build Windows x64 bundle
+        run: python scripts/build_binary.py --to dist/Tongle-windows-x64
+      - name: Run relocated binary with synthetic loopback provider
+        run: python tests/windows_acceptance.py --binary dist/Tongle-windows-x64/tongle.exe --report dist/windows-acceptance.json
+      - name: Archive verified bundle
+        shell: pwsh
+        run: Compress-Archive -Path dist/Tongle-windows-x64 -DestinationPath dist/Tongle-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tongle-windows-x64
+          path: |
+            dist/Tongle-windows-x64.zip
+            dist/windows-acceptance.json
+          retention-days: 14
+          if-no-files-found: error

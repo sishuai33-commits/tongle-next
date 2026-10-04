@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "id": "status-evidence-boundary",
+  "version": "1",
+  "project": "synthetic-status",
+  "material": "synthetic",
+  "notes": "有意构造过时卡片，验证修正内容后新会话能否正确区分助手执行报告、待执行与用户验收。不是生产发现，也不是编译器自动修复证明。",
+  "sources": [
+    {
+      "key": "request",
+      "role": "user",
+      "text": "青岚项目本轮需要完成配置巡检，提交执行报告，用户另行验收。"
+    },
+    {
+      "key": "report",
+      "role": "assistant",
+      "text": "青岚配置巡检执行报告：已检查约定的配置项，已提交巡检结果。本条是助手执行自述，尚无用户验收。"
+    },
+    {
+      "key": "pending",
+      "role": "user",
+      "text": "白鹭项目提出接口验证请求，目前尚未开始执行。"
+    },
+    {
+      "key": "marker",
+      "role": "user",
+      "text": "青岚项目的演示标识是松涛37。"
+    }
+  ],
+  "cards": [
+    {
+      "key": "qinglan-status",
+      "title": "青岚配置巡检状态",
+      "body": "青岚项目配置巡检仍待执行，目前只有检查请求，没有执行报告，尚未用户验收。",
+      "evidence": [
+        {
+          "source": "request",
+          "quote": "青岚项目本轮需要完成配置巡检，提交执行报告，用户另行验收。"
+        }
+      ]
+    },
+    {
+      "key": "bailu-status",
+      "title": "白鹭接口验证状态",
+      "body": "白鹭接口验证尚未开始执行；当前状态为pending。",
+      "evidence": [
+        {
+          "source": "pending",
+          "quote": "白鹭项目提出接口验证请求，目前尚未开始执行。"
+        }
+      ]
+    },
+    {
+      "key": "qinglan-marker",
+      "title": "青岚演示标识",
+      "body": "青岚项目演示标识是松涛37。",
+      "evidence": [
+        {
+          "source": "marker",
+          "quote": "青岚项目的演示标识是松涛37。"
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "updated-status",
+      "prompt": "继续青岚配置巡检项目。请依据现有记录回答：是否已有助手执行报告，是否已有用户验收？只返回JSON，字段has_execution_report和user_accepted，值为布尔；证据缺失则null。",
+      "expect": {
+        "has_execution_report": true,
+        "user_accepted": false
+      }
+    },
+    {
+      "id": "pending-regression",
+      "prompt": "白鹭接口验证执行到哪一步了？只返回JSON字段status，未开始为pending、执行中为running、已完成为completed；证据缺失则null。",
+      "expect": {
+        "status": "pending"
+      }
+    },
+    {
+      "id": "unrelated-regression",
+      "prompt": "青岚项目的演示标识是什么？只返回JSON字段marker；证据缺失则null。",
+      "expect": {
+        "marker": "松涛37"
+      }
+    }
+  ],
+  "candidate": [
+    {
+      "key": "qinglan-status",
+      "body": "青岚配置巡检已有助手执行报告，报告称已检查配置项并提交结果；用户尚未验收。接续时保留执行自述与用户验收的区别，不把历史请求当成尚未执行。",
+      "reason": "根据后续执行报告补齐状态及证据身份，保持未验收边界。",
+      "evidence": [
+        {
+          "source": "request",
+          "quote": "青岚项目本轮需要完成配置巡检，提交执行报告，用户另行验收。"
+        },
+        {
+          "source": "report",
+          "quote": "青岚配置巡检执行报告：已检查约定的配置项，已提交巡检结果。本条是助手执行自述，尚无用户验收。"
+        }
+      ]
+    }
+  ],
+  "review": {
+    "approved": true,
+    "findings": [],
+    "proposal_hash": "f17e4ddcebf7139981d20c40530c9a46ae2a701d22a52b1556cbcda790dcf469",
+    "reviewer": "Codex independent audit_review: source/candidate/criteria reviewed before native run"
+  }
+}

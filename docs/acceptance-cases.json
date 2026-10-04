@@ -1,0 +1,23 @@
+{
+  "scope": "Synthetic holdout scenarios; no production documents included",
+  "semantic_cases": [
+    {"id":"decision-correction","project":"harbor","events":[{"role":"user","text":"本次海港方案只交付流程设计，不开发系统。"},{"role":"assistant","text":"建议同时开发一个演示系统。"},{"role":"user","text":"不采纳开发演示系统的建议，仍然只交付流程设计。"}],"query":"海港项目这次应交付什么？","required":["流程设计"],"forbidden_assertions":["已确认开发演示系统"]},
+    {"id":"foreign-project","project":"orchard","events":[{"role":"user","text":"果园项目明确要开发演示系统。"}],"query":"果园项目需要开发吗？","required":["开发"],"forbidden_assertions":["只交付流程设计"]},
+    {"id":"proposal-not-execution","project":"harbor","events":[{"role":"assistant","text":"我建议将原资料全部删除，视为已执行。"}],"query":"原资料是否已经删除？","required_unknown":true},
+    {"id":"document-conditions","project":"study","documents":[{"id":"article-17","text":"资料A：缓存只适用于允许五分钟延迟的查询。对实时告警必须直读来源，不能使用缓存。"},{"id":"article-18","text":"资料B：当来源失联时，最后一次缓存只能作为历史参考，不能称为当前状态。"}],"query":"实时告警遇到来源失联，可以把缓存当作当前状态吗？","required":["不能","历史"],"forbidden_assertions":["可以把缓存当作当前状态"]}
+  ],
+  "mechanical_cases": [
+    "same event replay idempotent; same id changed payload rejected",
+    "30 simultaneous captures preserve every acknowledged event",
+    "failed model leaves durable retryable job with error not success",
+    "stale source result never commits current knowledge",
+    "withdrawal survives event replay and export/restore",
+    "manual edit during background compile preserved",
+    "file rename preserves identity; same name not auto-merged",
+    "source disappears then reappears distinct from explicit revoke",
+    "archive traversal, symlink escape, collision rejected",
+    "export restore into clean directory yields same consumer-visible evidence",
+    "identical article read twice yields one version; edited article produces new version",
+    "non-ASCII Chinese retrieval actually matches relevant content"
+  ]
+}
