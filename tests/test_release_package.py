@@ -106,7 +106,7 @@ class ReleasePackage(unittest.TestCase):
             'adapters/node_modules/canary.ts': '// node_modules canary\n',
             'tests/build/canary.py': 'BUILD = True\n',
             'tongle/vendor/canary.py': 'VENDOR = True\n',
-            'docs/operations.md': '# ops\n',
+            'docs/private-operations.md': '# ops\n',
             'docs/private/secrets.md': 'SECRET = "canary"\n',
             'scripts/rogue_ops.py': 'ROGUE = True\n',
             'examples/unselected/bad.json': '{"material": "other"}\n',
@@ -169,7 +169,7 @@ class ReleasePackage(unittest.TestCase):
                 self.assertEqual(
                     hashlib.sha256(zf.read(PACKAGE_PREFIX + key)).hexdigest(), digest)
             # excluded canaries never leak
-            for bad in ['docs/operations.md', 'scripts/rogue_ops.py',
+            for bad in ['docs/private-operations.md', 'scripts/rogue_ops.py',
                         'examples/unselected/bad.json', 'auth/global.json',
                         'tongle/.cache/canary.py', 'tongle/cache/canary.py',
                         'tongle/evidence/canary.py', 'adapters/.runtime/canary.ts',

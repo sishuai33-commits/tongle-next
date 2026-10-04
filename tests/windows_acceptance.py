@@ -16,6 +16,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests.fact_review_stub import FACT_AUDIT_TASK, _synthetic_fact_audit_response
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -34,7 +37,9 @@ def main():
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             payload = json.loads(request['messages'][-1]['content'])
-            if 'proposal' in payload:
+            if payload.get('task') == FACT_AUDIT_TASK:
+                answer = _synthetic_fact_audit_response(payload)
+            elif 'proposal' in payload:
                 answer = {'approved': True, 'findings': []}
             elif 'sources' in payload:
                 relevant = [s for s in payload['sources'] if '青溪合成' in s.get('text', '')]
