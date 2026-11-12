@@ -27,11 +27,12 @@ def owned(card):
 
 
 def scopes(cfg):
+    from .memory_policy import processing_allowed
     raw = cfg.get('knowledge_synthesis_topics', {})
     if not isinstance(raw, dict):
         return {}
     return {p: sorted(set(ts)) for p, ts in raw.items()
-            if isinstance(p, str) and p and isinstance(ts, list) and ts
+            if isinstance(p, str) and p and processing_allowed(cfg,p) and isinstance(ts, list) and ts
             and all(isinstance(t, str) and t.strip() for t in ts)}
 
 

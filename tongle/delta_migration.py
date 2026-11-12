@@ -762,7 +762,8 @@ def apply(evo, plan):
 
             # Mark parents obsolete with a bounded, body-free reason and clear
             # only the lease. Old bundle/inputs/proposal/review/calls/audits/
-            # batches/attempts are preserved verbatim.
+            # batches/attempts are preserved verbatim; dead payloads are swept
+            # later by the bounded reclaim step, never in this audit write.
             for parent in fresh['parents']:
                 reason = ('responsibility transferred: %s'
                           % fresh['request']['grant_id'])[:200]

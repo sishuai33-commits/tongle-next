@@ -63,10 +63,13 @@ def format_statement(item):
     created = item.get("created_at") or "unknown-time"
     src = item.get("source_id") or "unknown-source"
     text = (item.get("text") or "").strip()
+    if item.get('version') is not None:
+        src = '%s@%s offset %s' % (src,item['version'],item.get('offset',0))
     return "- [%s] (%s, %s, source %s) %s" % (status, role, created, src, text)
 
 
-def render_context(cards, notices, statements, locator_for, budget=CONTEXT_BUDGET_UNITS):
+def render_context(cards, notices, statements, locator_for, budget=CONTEXT_BUDGET_UNITS,
+                   health=None):
     """Render the whole consumer payload within ``budget`` UTF-16 units.
 
     Returns ``(rendered, delivered, offered)``:
@@ -80,19 +83,29 @@ def render_context(cards, notices, statements, locator_for, budget=CONTEXT_BUDGE
 
     ``locator_for(card)`` returns the locator text (title + evidence path) and
     must never raise: a card with no resolvable path is simply omitted.
+
+    ``health`` is an optional host status line (see ``tongle/health.py``). It
+    counts as content on purpose: an installation that needs attention must be
+    visible even on a turn that would otherwise be a bare acknowledgement --
+    that invisibility is the exact failure this line exists to fix. When there
+    is nothing to report the line is empty and acknowledgement semantics are
+    unchanged.
     """
     segments = []
     used = 0
     delivered = []
     offered = []
+    content_blocks = 0
 
-    def _try_add(text):
-        nonlocal used
+    def _try_add(text, content=True):
+        nonlocal used, content_blocks
         need = utf16_units(text) + (1 if segments else 0)
         if used + need > budget:
             return False
         segments.append(text)
         used += need
+        if content:
+            content_blocks += 1
         return True
 
     # 1. Preamble first, always (it is the fixed wrapper and must fit).
@@ -100,6 +113,11 @@ def render_context(cards, notices, statements, locator_for, budget=CONTEXT_BUDGE
         return "", [], []
     segments.append(CONTEXT_PREAMBLE)
     used = utf16_units(CONTEXT_PREAMBLE)
+
+    # 1b. Host status line, when something needs a human. It counts as content
+    #     so a broken installation is visible even on an otherwise-empty turn.
+    if isinstance(health, str) and health.strip():
+        _try_add(health)
 
     # 2. Important correction notices before cards.
     for notice in notices or ():
@@ -109,7 +127,9 @@ def render_context(cards, notices, statements, locator_for, budget=CONTEXT_BUDGE
     # 3. Raw statements (whole blocks, newest last). The header is one block.
     st = [s for s in (statements or ()) if isinstance(s, dict)]
     if st:
-        header_added = _try_add(RECENT_STATEMENTS_HEADER)
+        header = ('Retrieved source excerpts (raw evidence; role and version are explicit; historical text does not override effective corrections):'
+                  if any(s.get('status') == 'raw_evidence' for s in st) else RECENT_STATEMENTS_HEADER)
+        header_added = _try_add(header)
         if not header_added:
             st = []
         for item in st:
@@ -137,7 +157,7 @@ def render_context(cards, notices, statements, locator_for, budget=CONTEXT_BUDGE
             offered.append({"id": card.get("id"), "version": card.get("version"),
                             "title": title, "body": "", "delivery": "locator"})
 
-    if len(segments) <= 1:  # only the preamble
+    if content_blocks == 0:  # nothing but the wrapper and a host status line
         return "", [], []
     rendered = "\n".join(segments)
     return rendered, delivered, offered

@@ -4,7 +4,6 @@ import time
 import unicodedata
 import uuid
 import hashlib
-from .presentation import windows_reserved_name
 import sqlite3
 from .knowledge_relations import Relations
 
@@ -71,8 +70,6 @@ def _norm_path(p):
         if not s or s in (".", "..") or s.startswith("."):
             raise ValueError("invalid path segment")
         if s.endswith((" ", ".")) or not _SEG_RE.match(s):
-            raise ValueError("invalid path segment")
-        if windows_reserved_name(s):
             raise ValueError("invalid path segment")
     if not p.lower().endswith(".md"):
         raise ValueError("path must have .md suffix")
@@ -255,7 +252,16 @@ class KnowledgeStore:
             out.append(entry)
         if new_count > _MAX_EVID:
             raise ValueError("evidence new entries exceed 12")
-        if inherited_keys and not inherited_keys.issubset(seen):
+        # Retention is required only for provenance whose source is still
+        # available. A revoked/unavailable source has been retracted by an
+        # operator: it stays in the card's stored history but can no longer
+        # ground new operations, so updates must not be forced to re-cite it
+        # (which would deadlock the card forever on a retracted citation).
+        retained_required = {
+            ref for ref in inherited_keys
+            if isinstance(ref[0], str) and self.engine.source_available(ref[0])
+        }
+        if retained_required and not retained_required.issubset(seen):
             raise ValueError("update must retain all existing evidence")
         return out
 

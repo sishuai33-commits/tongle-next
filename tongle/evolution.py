@@ -14,7 +14,10 @@ import time
 import uuid
 
 from .knowledge_store import KnowledgeStore
+from .health import attention_line
+from .memory_runtime import allowed as processing_allowed, source_allowed
 from .model_errors import ModelError, from_exception, usage_totals
+from .triage import CAPACITY, CONTENT, classify
 from .model_refs import encode_references, decode_references
 from .evidence_selection import (DEFAULT_BODY_BUDGET_CHARS, DEFAULT_INITIAL_BODY_CHARS,
     DEFAULT_MAX_INPUT_BYTES, MAX_STAGE_CALLS, MAX_SEARCH_RECEIPTS, Selection,
@@ -145,7 +148,7 @@ OPERATION_SCHEMA = ('create {op,key,kind:memory|knowledge|framework,topic,title,
 
 def config(engine):
     p = engine.home / 'config.json'
-    settings = json.loads(p.read_text(encoding='utf-8')) if p.is_file() else {}
+    settings = json.loads(p.read_text()) if p.is_file() else {}
     # One-time backlog credit, keyed to the current UTC day. This is an
     # additive daily allowance on top of the base budgets and is applied to
     # the returned mapping only: the on-disk config is never rewritten, and
@@ -209,7 +212,9 @@ def _strong_consumer_topic(card, query, spec):
 
 
 def enabled(engine):
-    return config(engine).get('knowledge_mode') == 'evolving'
+    # Compatibility name: selects the knowledge backend, not processing permission.
+    from .memory_policy import uses_knowledge_store
+    return uses_knowledge_store(config(engine))
 
 
 def canonical(value):
@@ -267,6 +272,10 @@ CREATE TABLE IF NOT EXISTS knowledge_consumption (
 );
 CREATE TABLE IF NOT EXISTS knowledge_failures (
  work_id TEXT NOT NULL, state TEXT NOT NULL, error TEXT NOT NULL, created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_triage (
+ work_id TEXT PRIMARY KEY, class TEXT NOT NULL, action TEXT NOT NULL,
+ note TEXT NOT NULL, actor TEXT NOT NULL, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS knowledge_feedback (
  receipt_id TEXT PRIMARY KEY,project TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL
@@ -354,6 +363,8 @@ class Evolution:
         Capture itself stays successful when association cannot be established.
         """
         unknown = {'binding': 'unknown'}
+        if not source_allowed(self.engine, source_id):
+            return dict(unknown, reason='memory_only')
         with self.engine.locked(), self.engine.transaction():
             self.db.execute("UPDATE jobs SET state='batched' WHERE source_id=? AND state IN ('pending','retry')", (source_id,))
             if role != 'assistant':
@@ -393,7 +404,9 @@ class Evolution:
 
     def queue(self, force=False):
         from . import delta_routing
-        cfg = config(self.engine); quiet = max(0, float(cfg.get('knowledge_quiet_seconds', 300)))
+        cfg = config(self.engine)
+        if cfg.get('knowledge_mode') == 'memory': return 0
+        quiet = max(0, float(cfg.get('knowledge_quiet_seconds', 300)))
         # An explicitly invalid pipeline-protocol config must raise BEFORE any
         # queue mutation: never silently re-pin or drop existing jobs.
         delta_routing.resolve_protocol(cfg)
@@ -403,6 +416,7 @@ class Evolution:
             max_attempts = max(1, min(5, _int_or(cfg.get('knowledge_max_attempts'), 3)))
             for row in self.db.execute("SELECT * FROM knowledge_work WHERE state='blocked' AND pipeline_protocol=?", (delta_routing.LEGACY_PROTOCOL,)).fetchall():
                 job = dict(row)
+                if not processing_allowed(self.engine,job['project']): continue
                 if 'revoked' in str(row['error'] or ''):
                     # A revoked source cannot return; keep explicit blocked
                     # responsibility for an operator instead of auto-resetting.
@@ -428,12 +442,15 @@ class Evolution:
             # Isolated v2 routing runs FIRST, inside the existing lock/tx, and
             # reports every eligible v2 source so the legacy grouping below can
             # never steal one (even while quiet or limited to one per session).
+            from . import dependency_maintenance
+            dependency = dependency_maintenance.queue_sources(self, cfg, now)
             routing = delta_routing.queue_events(self, cfg, force, now)
-            count += routing['queued']
-            v2_handled = set(routing.get('eligible') or []) | set(routing.get('skipped') or [])
+            count += routing['queued'] + dependency['queued']
+            v2_handled = (set(routing.get('eligible') or []) | set(routing.get('skipped') or [])
+                          | set(dependency['eligible']))
             rows = self.db.execute('SELECT id,project,session,kind,created_at FROM sources ORDER BY created_at,id').fetchall()
             for row in rows:
-                if row['id'] in v2_handled: continue
+                if row['id'] in v2_handled or not source_allowed(self.engine,row['id']): continue
                 if not self.engine.source_available(row['id']): continue
                 source = self.engine.store.source(row['id'])
                 for part in self._source_parts(source):
@@ -463,34 +480,66 @@ class Evolution:
         return count
 
     def queue_dependents(self):
-        changed=self.cards.relations.changed()
-        for item in changed:
-            from .topic_synthesis import owned
-            if owned(self.cards.get(item['card_id'])):
-                continue
-            key=fingerprint(item)
-            text='知识依赖版本发生变化。请对照已更新的依据，核对原卡是否需要修正；不能把这条系统观察当作新的外部事实或用户决定。\n'+canonical(item)
-            receipt=self.engine.store.capture(item['project'],'knowledge-dependency','assistant','dependency:'+key,text)
-            self.captured(receipt['source_id'],'assistant','knowledge-dependency')
-        return len(changed)
+        from . import dependency_maintenance
+        from .topic_synthesis import owned
+        cfg = config(self.engine)
+        with self.engine.locked():
+            changed = self.cards.relations.changed()
+            changed = [x for x in changed if processing_allowed(self.engine,x['project'])]
+            for item in changed:
+                if owned(self.cards.get(item['card_id'])):
+                    continue
+                key = fingerprint(item)
+                existing = self.db.execute('SELECT 1 FROM events WHERE project=? AND event_id=?',
+                                           (item['project'], 'dependency:' + key)).fetchone()
+                text = dependency_maintenance.di.DEPENDENCY_PREFIX + canonical(item)
+                receipt = self.engine.store.capture(item['project'], 'knowledge-dependency',
+                                                    'assistant', 'dependency:' + key, text)
+                if not existing:
+                    with self.engine.transaction():
+                        dependency_maintenance.mark_new_source(self, receipt, item, cfg)
+                self.captured(receipt['source_id'], 'assistant', 'knowledge-dependency')
+            return len(changed)
 
     def framework(self,project,question):
+        if not processing_allowed(self.engine,project): return {'queued':False,'disabled':True,'reason':'memory_only'}
         receipt=self.engine.store.capture(project,'framework-maintenance','user','framework:'+uuid.uuid4().hex,
             '框架维护请求：'+question+'。请比较已有相关卡片，按问题、概念关系、判断步骤、条件、分歧与依据编排；使用 basis_cards 明确派生关系，不把请求本身当作业务事实。')
         self.captured(receipt['source_id'],'user','framework-maintenance')
         return dict(receipt,queued=self.queue(force=True))
 
     def _valid_card(self, card, seen=None):
+        if not card or (seen and (card['id'] in seen or len(seen)>32)): return False
+        cache=getattr(self,'_valid_cache',None)
+        key=(card['id'],card['version'])
+        if cache is not None and key in cache:return cache[key]
+        valid=self._valid_card_uncached(card,seen)
+        if cache is not None:cache[key]=valid
+        return valid
+
+    def _valid_card_uncached(self, card, seen=None):
         if not card or card['state'] != 'active': return False
+        from .retrieval_budget import verify_identity
+        if not verify_identity(self.engine,'card',card['id'],card['version']):return False
         from .topic_synthesis import owned, TopicSynthesis
         if owned(card) and not TopicSynthesis(self).consumable(card): return False
         seen=set() if seen is None else seen
         if card['id'] in seen or len(seen)>32:return False
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='organization_relations'").fetchone():
+            from .knowledge_organization import KnowledgeOrganization
+            from .retrieval_freshness import source_current
+            for relation in KnowledgeOrganization(self.engine,self.cards).list_relations(card['project'],card['id']):
+                if relation['category'] != 'evidence': continue
+                if relation['state'] != 'current': return False
+                if not all(source_current(self.engine,r['source_id']) for r in relation['evidence']): return False
+                if not self._valid_card(self.cards.get(relation['target_id']),seen|{card['id']}): return False
         for ref in card.get('basis_cards',[]):
             basis=self.cards.get(ref['card_id'])
             if not basis or basis['version']!=ref['version'] or not self._valid_card(basis,seen|{card['id']}):return False
         for ref in card['evidence']:
             if not self.engine.source_available(ref['source_id']): return False
+            from .retrieval_freshness import source_current
+            if not source_current(self.engine,ref['source_id']): return False
             try: source = self.engine.store.source(ref['source_id'])
             except (ValueError, KeyError): return False
             # Unrelated edits do not invalidate an unchanged cited passage.
@@ -506,15 +555,119 @@ class Evolution:
         tracking = self.db.execute('SELECT * FROM knowledge_files WHERE card_id=?', (card['id'],)).fetchone()
         return bool(tracking and tracking['state'] == 'ok' and tracking['version'] == card['version'])
 
-    def context(self, project, query, limit=8, session=''):
+    def context(self, project, query, limit=8, session='', budget=6000,current_source_id=None):
+        self._valid_cache={}
+        self._source_index_report=None
+        self._raw_retrieval_report=None
+        self.engine._retrieval_source_checks={}
+        try:
+            from .retrieval_budget import verification_scope
+            with verification_scope(self.engine):
+                return self._context(project,query,limit,session,budget,current_source_id)
+        finally:
+            del self._valid_cache
+            del self._source_index_report
+            del self._raw_retrieval_report
+            del self.engine._retrieval_source_checks
+
+    def _context(self, project, query, limit=8, session='', budget=6000,current_source_id=None):
+        if type(budget) is not int or not 1 <= budget <= 6000:
+            raise ValueError('context budget must be between 1 and 6000 UTF-16 units')
+        context_started = time.perf_counter()
+        stage_timings = {}
         from .knowledge_files import KnowledgeFiles
-        files = KnowledgeFiles(self.engine, self.cards); sync_result=files.sync()
-        if sync_result['changed']:
-            try:files.publish()
-            except OSError:pass
         cfg = config(self.engine)
+        memory_mode = not processing_allowed(self.engine,project)
+        automatic_context = cfg.get('memory_automatic_context_enabled', True)
+        if type(automatic_context) is not bool:
+            raise ValueError('memory_automatic_context_enabled must be boolean')
+        if not automatic_context:
+            # This is a context policy, not an instance or write switch. Keep
+            # the mode so hosts still supply their existing memory tool/write
+            # guide and the capture acknowledgement's current-source identity.
+            # No discovery, file sync, model, correction projection or receipt
+            # is prepared for a deliberately empty automatic projection.
+            return {'results': [], 'recent_statements': [], 'notices': [],
+                    'rendered_context': '', 'mode': 'memory' if memory_mode else 'evolving',
+                    'adoption': 'unknown', 'receipt_id': None,
+                    'automatic_context_enabled': False,
+                    'retrieval': {'strategy': 'disabled', 'reason': 'automatic_context_disabled',
+                                  'provider_requests': 0}}
+        files = KnowledgeFiles(self.engine, self.cards)
+        retrieval_report = None
+        query_plan = None
+        if memory_mode:
+            from .knowledge_index import KnowledgeIndex
+            from .retrieval_freshness import candidate_dependencies
+            index_started = time.perf_counter()
+            index = KnowledgeIndex(self.engine, self.cards)
+            stage_timings['index'] = (time.perf_counter()-index_started)*1000
+            candidates, retrieval_report = index.candidates(project, query, cfg,
+                self._session_anchor_turns(project,session,query))
+            for stage, elapsed in retrieval_report.get('stage_timings',{}).items():
+                stage_timings[stage] = stage_timings.get(stage,0)+elapsed
+            from .semantic_index import semantic_candidates
+            from .memory_selection import resolve_memory_query
+            interpreted=interpret_request(query)
+            if interpreted.ack_only or interpreted.no_history or is_acknowledgement(query):
+                candidates=[]
+                semantic_report={'strategy':'lexical','cache_state':'bypass'}
+            else:
+                semantic_query=resolve_memory_query(candidates,query,project,
+                    lambda:self._session_anchor_turns(project,session,query)) or query
+                from .retrieval_plan import build_context_plan
+                query_plan=build_context_plan(semantic_query)
+                if semantic_query!=query:
+                    candidates=index.search_many(project,query_plan,cfg)
+                candidates, semantic_report = semantic_candidates(index,project,semantic_query,cfg,candidates,
+                    plan=query_plan,rerank_budget=18,token_budget=18*512)
+            for stage, elapsed in semantic_report.get('stage_timings',{}).items():
+                stage_timings[stage] = stage_timings.get(stage,0)+elapsed
+            degraded_reasons = list(dict.fromkeys(r for r in (
+                retrieval_report.get('degraded'),semantic_report.get('degraded')) if r))
+            retrieval_report.update(semantic_report)
+            if degraded_reasons:
+                retrieval_report['degraded']=degraded_reasons[0]
+                retrieval_report['degraded_reasons']=degraded_reasons
+            from .online_admission import requested as online_requested
+            if online_requested(cfg):
+                from .online_admission import verification_candidates
+                candidates, omitted = verification_candidates(candidates)
+                retrieval_report['preverification_candidates_omitted'] = omitted
+                retrieval_report['preverification_candidate_limit'] = 24
+            ids, complete_dependencies = candidate_dependencies(self.cards, candidates)
+            if not complete_dependencies:
+                candidates = []
+                retrieval_report.setdefault('degraded','dependency_budget_exceeded')
+                retrieval_report.setdefault('degraded_reasons',[]).append('dependency_budget_exceeded')
+            sync_started = time.perf_counter()
+            sync_result = files.sync(ids)
+            if sync_result['changed']:
+                try: files.publish(ids)
+                except OSError: pass
+            stage_timings['sync'] = (time.perf_counter()-sync_started)*1000
+            if sync_result['changed']:
+                index_started = time.perf_counter()
+                index.refresh()
+                stage_timings['index'] += (time.perf_counter()-index_started)*1000
+            # Re-read only those identities: a human edit can change their body.
+            selection_started = time.perf_counter()
+            all_cards = [dict(c,**{k:v for k,v in old.items() if c['version']==old['version'] and (k.startswith('_semantic') or k.startswith('_graph') or k=='_rerank_score')}) for old in candidates if (c := self.cards.get(old['id'])) and self._valid_card(c)]
+            if any(c.get('_graph_paths') for c in all_cards):
+                from .graph_retrieval import filter_graph_candidates
+                all_cards = filter_graph_candidates(self.engine, project, all_cards)
+            budget = min(budget,3200)
+        else:
+            sync_started = time.perf_counter()
+            sync_result = files.sync()
+            if sync_result['changed']:
+                try: files.publish()
+                except OSError: pass
+            stage_timings['sync'] = (time.perf_counter()-sync_started)*1000
+            selection_started = time.perf_counter()
+            scopes = [project] + ([] if project in cfg.get('library_excluded_projects', []) else ['shared'])
+            all_cards = [c for scope in dict.fromkeys(scopes) for c in self.cards.list(scope) if self._valid_card(c) and c['kind'] not in ('source','index')]
         scopes = [project] + ([] if project in cfg.get('library_excluded_projects', []) else ['shared'])
-        all_cards = [c for scope in dict.fromkeys(scopes) for c in self.cards.list(scope) if self._valid_card(c) and c['kind'] not in ('source','index')]
         topic_map=cfg.get('knowledge_project_topics',{})
         allowed=topic_map.get(project) if isinstance(topic_map,dict) else None
         if isinstance(allowed,list) and all(isinstance(x,str) for x in allowed):
@@ -534,7 +687,41 @@ class Evolution:
         # project state (for example payroll) keeps working, and a correction
         # whose impact cannot be linked lexically adds a notice but suppresses
         # nothing. This never blanks the whole project state.
-        corrections = [] if (ack or suppressed) else self._pending_correction_records(project)
+        memory_mode = not processing_allowed(self.engine,project)
+        consumer_selector=select_consumer_topic
+        consumer_query=query
+        prior_provider=lambda:self._session_anchor_turns(project,session,query)
+        if memory_mode:
+            from .memory_selection import select_memory_topic, resolve_memory_query
+            from .raw_retrieval import lexical_candidates
+            consumer_selector=lexical_candidates
+            consumer_query=resolve_memory_query(all_cards,query,project,prior_provider)
+            requested_retrieval=cfg.get('retrieval',{})
+            if isinstance(requested_retrieval,dict) and requested_retrieval.get('strategy')=='online_admission':
+                from .online_admission import local_candidates
+                consumer_selector=local_candidates
+                from .memory_relevance import query_terms
+                if not consumer_query and len(query_terms(query,project))>=2 and local_candidates(all_cards,query,project):
+                    consumer_query=query
+            if isinstance(requested_retrieval,dict) and requested_retrieval.get('strategy') in ('hybrid','rerank'):
+                from .semantic_index import select_semantic_cards
+                from .memory_relevance import query_terms
+                if not consumer_query and len(query_terms(query,project))>=2 and select_semantic_cards(all_cards,query,project,cfg,[]):
+                    consumer_query=query
+                def consumer_selector(cards,text,scope,prior_provider=None):
+                    lexical=lexical_candidates(cards,text,scope,prior_provider)
+                    return select_semantic_cards(cards,text,scope,cfg,lexical)
+            # One admitted subject drives cards and raw evidence. Do not run
+            # a second recovery after filtering or borrow another session.
+            prior_provider=None
+            from .memory_relevance import named_query_terms
+            completion_check=bool(re.search(r'(?:已经|是否|有没有|有无).{0,4}(?:验证|测试|确认|跑通|测过|完成)',query))
+            if (completion_check and not named_query_terms(consumer_query,project)
+                    and not any(c['project']==project and c['kind']=='memory' for c in select_memory_topic(all_cards,consumer_query,project))
+                    and not self._session_anchor_turns(project,session,query)):
+                consumer_query=''
+                if retrieval_report is not None:retrieval_report['admission']='status_subject_unresolved'
+        corrections = [] if (ack or suppressed or memory_mode) else self._pending_correction_records(project)
         correction_terms = set()
         correction_sources = set()
         for rec in corrections:
@@ -553,10 +740,28 @@ class Evolution:
         if affected:
             all_cards = [c for c in all_cards if c['id'] not in affected]
         notices = [rec['notice'] for rec in corrections]
-        chosen = ([] if ack else select_consumer_topic(
-            all_cards, query, project,
-            prior_provider=lambda: self._session_anchor_turns(project, session, query)))
-        chosen = chosen[:max(1, min(limit, 12))]
+        if query_plan and 'bounded_query_projection' in query_plan.reasons:
+            notices.append('本轮材料较长，自动检索使用了有限片段；结果可能不完整，请对需要核对的具体问题显式检索。')
+        raw_memory = None
+        durable_corrections = (self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_memory_corrections'").fetchone()
+            and self.db.execute('SELECT 1 FROM source_memory_corrections WHERE project IN ('+','.join('?' for _ in scopes)+') LIMIT 1',scopes).fetchone())
+        if (memory_mode or durable_corrections) and not (ack or suppressed):
+            from .memory_runtime import context_inputs
+            from .online_transport import MAX_ONLINE_CONTEXT_SECONDS
+            focus=consumer_selector(all_cards,consumer_query,project,
+                prior_provider=prior_provider)
+            all_cards, memory_notices, raw_memory = context_inputs(self,project,query,all_cards,
+                focus=[c['id'] for c in focus],session=session,current_source_id=current_source_id,
+                effective_query=consumer_query if memory_mode else None,
+                dependency_ids=ids if memory_mode else (),query_plan=query_plan,config=cfg,
+                online_deadline=context_started+MAX_ONLINE_CONTEXT_SECONDS,
+                admission=lambda candidates:consumer_selector(candidates,consumer_query,project,
+                    prior_provider=prior_provider))
+            notices.extend(memory_notices)
+        chosen = ([] if ack else consumer_selector(
+            all_cards, consumer_query, project, prior_provider=prior_provider))
+        if not memory_mode:
+            chosen = chosen[:max(1, min(limit, 12))]
         root = Path(self.db.execute("SELECT value FROM meta WHERE key='vault'").fetchone()[0])
 
         def locator_for(card):
@@ -572,7 +777,39 @@ class Evolution:
             else self._recent_statement_fallback(project, query, session, all_cards)
         # One whole-block renderer/budget; nothing is sliced. The offered
         # projection is the exact receipt and is never mutated afterwards.
-        rendered, delivered, offered = render_context(chosen, notices, fallback, locator_for)
+        if raw_memory is not None: fallback = raw_memory
+        from .retrieval_budget import verification_report
+        verification=verification_report(self.engine)
+        if verification.get('verification_budget_exhausted'):
+            notices.append('本轮依据核验已达到限额，未核验资料暂不投递；当前结果可能不完整，请按具体问题显式检索。')
+        if retrieval_report is not None:retrieval_report.update(verification)
+        if memory_mode and not ack and not suppressed:
+            from .review_work import ReviewWork
+            reviews = ReviewWork(self.engine).pending(project, limit=3)
+            if reviews:
+                identities = ', '.join(r['review_id'] for r in reviews)
+                notices.append('当前项目有未闭合复盘批次：' + identities + '。仅在相关接续/收尾时用 memory review status 查看范围、缺口和版本；不阻断当前任务，不据此扩大授权。')
+        health = attention_line(self.engine)
+        if memory_mode or durable_corrections:
+            chosen=[dict(c,title=c['title']+' 【记忆:'+c['id']+'@'+str(c['version'])+'】') for c in chosen]
+        if memory_mode:
+            from .memory_brief import render_memory_context, prioritize_memory_cards
+            from .memory_runtime import annotate_notes
+            chosen=annotate_notes(self.engine,chosen)
+            # Apply the existing full-note preference before truncating the
+            # admitted set; a prefix of long locators must not hide a later
+            # complete condition. The renderer shares this exact length rule.
+            chosen=prioritize_memory_cards(chosen,project)[:max(1,min(limit,12))]
+            stage_timings['selection'] = (time.perf_counter()-selection_started)*1000
+            render_started = time.perf_counter()
+            rendered, delivered, offered = render_memory_context(
+                chosen, notices, fallback, locator_for, health=health,project=project,budget=budget,
+                request=consumer_query)
+        else:
+            stage_timings['selection'] = (time.perf_counter()-selection_started)*1000
+            render_started = time.perf_counter()
+            rendered, delivered, offered = render_context(
+                chosen, notices, fallback, locator_for, health=health,budget=budget)
         results = []
         for card in delivered:
             full = card.get('delivery') == 'full'
@@ -586,23 +823,63 @@ class Evolution:
             text = (card.get('body') or '') if full else path
             results.append({'id': card['id'], 'text': text, 'kind': card['kind'],
                 'status': 'compiled' if card.get('evidence') else 'curated_legacy',
-                'source_role': 'reviewed_knowledge', 'source_id': card['id'],
+                'source_role': (card.get('memory_metadata',{}).get('authority','legacy_unverified') if memory_mode else 'reviewed_knowledge'), 'source_id': card['id'],
                 'source_version': card['version'], 'evidence': card.get('evidence', []),
                 'title': card['title'], 'complete': full, 'path': path})
+        stage_timings['render'] = (time.perf_counter()-render_started)*1000
         pending = self.db.execute("SELECT COUNT(*) FROM knowledge_work WHERE project=? AND state IN ('pending','running','budget_wait','retry')", (project,)).fetchone()[0]
+        paused_pending = pending if memory_mode else 0
+        if memory_mode: pending = 0
         receipt = None
-        if not ack and not (suppressed and not chosen):
+        if not memory_mode and not ack and not (suppressed and not chosen):
+            record_started = time.perf_counter()
             receipt = uuid.uuid4().hex
             with self.engine.transaction():
                 self.db.execute("INSERT INTO knowledge_consumption(id,project,session,query,offered,state,created_at) VALUES(?,?,?,?,?,'offered',?)",
                                 (receipt, project, session, query[:4000], canonical(offered), time.time()))
+            stage_timings['record'] = (time.perf_counter()-record_started)*1000
         payload = {'results': results, 'recent_statements': fallback, 'adoption': 'unknown',
                    'receipt_id': receipt, 'pending_batches': pending, 'notices': notices,
-                   'rendered_context': rendered, 'mode': 'evolving'}
+                   'health': health,
+                   'rendered_context': rendered, 'mode': 'memory' if memory_mode else 'evolving',
+                   'paused_history_batches': paused_pending}
+        if retrieval_report is not None:
+            raw_report=self._raw_retrieval_report
+            if isinstance(raw_report,dict):
+                retrieval_report['raw']=raw_report
+                if raw_report.get('degraded'):
+                    retrieval_report.setdefault('degraded',raw_report['degraded'])
+                    reasons=retrieval_report.setdefault('degraded_reasons',[])
+                    if raw_report['degraded'] not in reasons:reasons.append(raw_report['degraded'])
+                counts=[r.get('rerank_pairs') for r in (retrieval_report,raw_report)]
+                retrieval_report['combined_rerank_pairs']=sum(counts) if all(type(n) is int for n in counts) else None
+                retrieval_report['combined_input_tokens_upper_bound']=sum(
+                    r.get('input_tokens_upper_bound',0) for r in (retrieval_report,raw_report))
+            source_report = self._source_index_report
+            if isinstance(source_report,dict):
+                retrieval_report['source_pending'] = source_report.get('pending_versions')
+                retrieval_report['source_index_partial'] = not source_report.get('complete',False)
+                if retrieval_report['source_index_partial']:
+                    retrieval_report.setdefault('degraded','source_index_partial')
+                    retrieval_report.setdefault('degraded_reasons',[]).append('source_index_partial')
+            payload['retrieval'] = retrieval_report
+        if memory_mode and cfg.get('memory_trace_enabled') is True:
+            from .memory_receipts import record_prepared_context
+            record_started = time.perf_counter()
+            payload['memory_receipt_id'], warning = record_prepared_context(
+                self.engine, project, session, rendered, delivered,
+                round((time.perf_counter() - context_started) * 1000, 3),
+                user_source_id=current_source_id, stage_timings=stage_timings)
+            stage_timings['record'] = (time.perf_counter()-record_started)*1000
+            if warning:
+                payload['memory_receipt_warning'] = warning
         if fallback:
             payload['recent_statements_note'] = (
-                '以下为未经核对的用户原始陈述，不是已确认的规则或事实，也不证明动作已执行；'
+                ('以下为带角色归属的原文片段，不是已确认的规则或事实，也不证明动作已执行；' if memory_mode else '以下为未经核对的用户原始陈述，不是已确认的规则或事实，也不证明动作已执行；') +
                 '较旧的失败陈述不会自动覆盖较新的有效卡片。')
+        stage_timings['total'] = (time.perf_counter()-context_started)*1000
+        payload['stage_timings'] = stage_timings
+        if retrieval_report is not None:retrieval_report['stage_timings'] = dict(stage_timings)
         return payload
 
     def _session_anchor_turns(self, project, session, query, limit=6):
@@ -878,6 +1155,24 @@ class Evolution:
         query = '\n'.join(p['text'] for p in inputs)
         ranked = rank(cards, query)
         mandatory = mandatory_ids(cards, inputs)
+        # Synthetic knowledge-dependency observations (queue_dependents) are
+        # not yet cited by any card, so mandatory_ids cannot find the
+        # dependent target or its changed basis. Parse the authoritative full
+        # source strictly and add those ids as mandatory roots, so the CURRENT
+        # target/basis closure is selected in full or explicitly blocked. The
+        # observation's versions are a historical notification only; the live
+        # cards below are authoritative. A malformed observation surfaces as a
+        # required problem and blocks; a normal conversation with the same
+        # prefix is untouched.
+        from .dependency_inputs import dependency_observation_ids
+        def _dep_lookup(sid):
+            try:
+                return self.engine.store.source(sid)
+            except (KeyError, ValueError, OSError):
+                return None
+        dep_ids, dep_problems = dependency_observation_ids(project, inputs,
+                                                           _dep_lookup)
+        mandatory |= dep_ids
         # A deterministic, IDF-free set of every card that shares a token with
         # the batch. Recorded as a host receipt so a *relevant* card appearing
         # or moving during processing blocks an old approval even for an
@@ -888,6 +1183,7 @@ class Evolution:
         # reference to a foreign/missing card is reported, never silently
         # dropped: the caller must block a final result until it is resolved.
         required_ids, required_problems = basis_closure_report(cards, mandatory)
+        required_problems = required_problems + dep_problems
         initial = self._initial_body_budget(cfg)
         total = self._body_budget(cfg)
         # Mandatory candidates are the source-dependent closure; select_bodies
@@ -1427,8 +1723,12 @@ class Evolution:
         sources = base.get('sources')
         if (isinstance(old_required, list) and isinstance(old_problems, list)
                 and isinstance(sources, list) and sources):
+            from .dependency_inputs import dependency_observation_ids
+            dep_ids, dep_problems = dependency_observation_ids(
+                base.get('project'), sources, self.engine.store.source)
             now_required, now_problems = basis_closure_report(
-                cards, mandatory_ids(cards, sources))
+                cards, mandatory_ids(cards, sources) | dep_ids)
+            now_problems += dep_problems
             old_ids = sorted(cid for cid in old_required if isinstance(cid, str))
             if sorted(now_required) != old_ids:
                 raise SelectionChanged('required closure changed since selection')
@@ -1899,13 +2199,42 @@ class Evolution:
 
         A stale worker (its token replaced by a newer owner) must never move or
         corrupt the row. The UPDATE is keyed on both id and current token.
+
+        State/error/finished-at are written conditionally; a settled failed
+        attempt also releases only its matching lease in this transaction.
+        Payloads and accounting remain unchanged for later audit. Dead bulky
+        payloads on obsoleted rows are reclaimed afterwards by the bounded
+        ``tongle/reclaim.py`` sweep instead of being erased inside an audited
+        transition.
         """
         with self.engine.transaction():
-            self.db.execute('UPDATE knowledge_work SET state=?,error=?,finished_at=? WHERE id=? AND lease_token=? AND state!=?',
+            cur = self.db.execute('UPDATE knowledge_work SET state=?,error=?,finished_at=? WHERE id=? AND lease_token=? AND state!=?',
                             (state, error, time.time(), job['id'], token, 'done'))
+            if state == 'failed' and cur.rowcount == 1:
+                # A terminal content/capacity failure is an explicit parked
+                # decision, not an alarm that needs a human every session.
+                # Inputs, calls and failure audit stay intact; doctor shows the
+                # row and the next safe action. Transient provider failures
+                # stay unparks so an outage remains visible.
+                category = classify(error)
+                if category in (CONTENT, CAPACITY):
+                    self.db.execute(
+                        'INSERT OR REPLACE INTO knowledge_triage'
+                        '(work_id,class,action,note,actor,created_at) VALUES(?,?,?,?,?,?)',
+                        (job['id'], category, 'parked',
+                         'terminal content/capacity failure; not retried blindly',
+                         'auto-park', time.time()))
             if next_at is not None:
                 self.db.execute('UPDATE knowledge_work SET next_at=? WHERE id=? AND lease_token=?',
                                 (next_at, job['id'], token))
+            # Release only this worker's settled terminal failure. An unknown
+            # in-flight call retains its lease for recovery; counters are intact.
+            if state == 'failed':
+                self.db.execute("UPDATE knowledge_work SET lease_token=NULL,lease_until=0 "
+                                "WHERE id=? AND lease_token=? AND state='failed' "
+                                "AND NOT EXISTS (SELECT 1 FROM knowledge_calls "
+                                "WHERE work_id=? AND elapsed IS NULL)",
+                                (job['id'], token, job['id']))
 
     def _completion_evidence(self, base, proposal, review, changed_ids, work_id=None):
         """Compact, body-free proof of why a completed/no-op batch was accepted.
@@ -4184,6 +4513,14 @@ class Evolution:
             continue
 
     def _call(self, job, stage, payload, cfg):
+        # Learning/topic callers may have no project on their dispatch job.
+        # Re-read the live policy: an already-created worker can hold an old
+        # cfg after global cutover, but must not start another model request.
+        from .memory_policy import read_home_config
+        if read_home_config(self.engine.home).get('knowledge_mode') == 'memory':
+            raise ValueError('semantic processing disabled for global memory mode')
+        if job.get('project') and not processing_allowed(self.engine,job['project']):
+            raise ValueError('semantic processing disabled for memory project')
         command = cfg.get('model_command')
         if not command: raise RuntimeError('model disabled')
         if stage == 'verify' and isinstance(payload, dict):
@@ -4569,7 +4906,7 @@ class Evolution:
             " COALESCE(l.attempts,0) AS attempts, COALESCE(l.lease_until,0) AS lease_until"
             " FROM knowledge_consumption c"
             " LEFT JOIN knowledge_consumption_lease l ON l.receipt_id=c.id"
-            " WHERE c.state='awaiting_check' ORDER BY c.created_at LIMIT 200").fetchall()
+            " WHERE c.state='awaiting_check' AND tongle_process(c.project) ORDER BY c.created_at LIMIT 200").fetchall()
         for row in rows:
             if result['called'] >= 1:
                 break
@@ -4678,6 +5015,7 @@ class Evolution:
 
     def queue_feedback(self):
         for row in self.db.execute("SELECT * FROM knowledge_feedback WHERE state='pending'").fetchall():
+            if not processing_allowed(self.engine,row['project']): continue
             linked = self.db.execute('SELECT binding FROM knowledge_consumption WHERE id=?', (row['receipt_id'],)).fetchone()
             if not linked or linked['binding'] != 'receipt':
                 with self.engine.transaction():
@@ -4690,7 +5028,7 @@ class Evolution:
 
     def process(self, limit=1, force=False):
         from .knowledge_files import KnowledgeFiles
-        from . import delta_routing, delta_execution
+        from . import delta_routing, delta_execution, dependency_maintenance
         cfg = config(self.engine); files = KnowledgeFiles(self.engine, self.cards)
         # One-time legacy recovery: invoked here so the installed loop drains it
         # automatically. The mechanism marker makes this idempotent, so repeated
@@ -4707,11 +5045,17 @@ class Evolution:
         with self.engine.locked():
             try:
                 files.sync()
-                publication=files.publish()
+                publication=files.publish(dependency_maintenance.publication_ids(self, cfg, files))
             except OSError as exc:
                 return {'processed':0,'failed':0,'records':0,'publication_error':type(exc).__name__,'pending':1}
             for prior in self.db.execute("SELECT id,bundle,review,proposal,pipeline_protocol FROM knowledge_work WHERE state='publication_pending'").fetchall():
                 protocol = prior['pipeline_protocol']
+                if dependency_maintenance.is_job(prior):
+                    try:
+                        dependency_maintenance.resume_publication(self, prior['id'], files)
+                    except (ValueError, OSError, RuntimeError, KeyError, TypeError):
+                        publication_errors += 1
+                    continue
                 if protocol == delta_routing.V2_PROTOCOL:
                     # A committed v2 batch resumes its OWN publication under the
                     # original lock; its bundle/inputs/proof are preserved and
@@ -4777,7 +5121,7 @@ class Evolution:
             from . import delta_operator
             operator_resume = delta_operator.resume_pending(self, files, limit=3)
             queued = self.queue(force)
-        result = {'queued':queued,'processed':0,'failed':0,'records':0,'disabled':not bool(cfg.get('model_command'))}
+        result = {'queued':queued,'processed':0,'failed':0,'records':0,'disabled':cfg.get('knowledge_mode')=='memory' or not bool(cfg.get('model_command'))}
         if operator_resume.get('operator_pending'):
             result['operator_pending'] = operator_resume['operator_pending']
         if operator_resume.get('operator_published'):
@@ -4799,12 +5143,17 @@ class Evolution:
         # Unknown-protocol waiting rows are reported, never executed.
         unknown_pending = self.db.execute(
             "SELECT COUNT(*) FROM knowledge_work WHERE pipeline_protocol NOT IN (?,?)"
-            " AND state IN ('pending','budget_wait','retry','running')",
+            " AND tongle_work_process(project,inputs) AND state IN ('pending','budget_wait','retry','running')",
             (delta_routing.LEGACY_PROTOCOL, delta_routing.V2_PROTOCOL)).fetchone()[0]
         if unknown_pending:
             result['unknown_protocol_pending'] = unknown_pending
         if result['disabled']:
-            result['pending'] = self.db.execute("SELECT COUNT(*) FROM knowledge_work WHERE state IN ('pending','budget_wait','running','retry','publication_pending','coverage_wait','operator_publication_pending')").fetchone()[0]
+            from .source_memory import SourceMemory
+            projects=[r[0] for r in self.db.execute('SELECT DISTINCT project FROM sources') if not processing_allowed(self.engine,r[0])]
+            result['source_index']=[SourceMemory(self.engine).index_sources(p) for p in projects]
+            from .memory_runtime import active_counts
+            result['processing_states']=active_counts(self.engine)
+            result['pending'] = self.db.execute("SELECT COUNT(*) FROM knowledge_work WHERE tongle_work_process(project,inputs) AND state IN ('pending','budget_wait','running','retry','publication_pending','coverage_wait','operator_publication_pending')").fetchone()[0]
             from .views import refresh
             try:result['navigation']=refresh(self.engine)
             except OSError as exc:result['navigation_error']=type(exc).__name__
@@ -4824,8 +5173,8 @@ class Evolution:
                 break
             now = time.time(); token = uuid.uuid4().hex
             with self.engine.locked(), self.engine.transaction():
-                self.db.execute("UPDATE knowledge_work SET state='failed',error='retry limit reached' WHERE state='running' AND pipeline_protocol IN (?,?) AND lease_until<? AND attempts>=?", (delta_routing.LEGACY_PROTOCOL,delta_routing.V2_PROTOCOL,now,max_attempts))
-                row = self.db.execute("SELECT * FROM knowledge_work WHERE attempts<? AND pipeline_protocol IN (?,?) AND (state='pending' OR (state IN ('budget_wait','retry') AND next_at<=?) OR (state='running' AND lease_until<?)) ORDER BY created_at LIMIT 1", (max_attempts,delta_routing.LEGACY_PROTOCOL,delta_routing.V2_PROTOCOL,now,now)).fetchone()
+                self.db.execute("UPDATE knowledge_work SET state='failed',error='retry limit reached' WHERE state='running' AND tongle_work_process(project,inputs) AND pipeline_protocol IN (?,?) AND lease_until<? AND attempts>=?", (delta_routing.LEGACY_PROTOCOL,delta_routing.V2_PROTOCOL,now,max_attempts))
+                row = self.db.execute("SELECT * FROM knowledge_work WHERE tongle_work_process(project,inputs) AND attempts<? AND pipeline_protocol IN (?,?) AND (state='pending' OR (state IN ('budget_wait','retry') AND next_at<=?) OR (state='running' AND lease_until<?)) ORDER BY created_at LIMIT 1", (max_attempts,delta_routing.LEGACY_PROTOCOL,delta_routing.V2_PROTOCOL,now,now)).fetchone()
                 if not row: break
                 job = dict(row)
                 self.db.execute("UPDATE knowledge_work SET state='running',lease_token=?,lease_until=?,attempts=attempts+1 WHERE id=?", (token, now+600, job['id']))
@@ -4837,6 +5186,17 @@ class Evolution:
                 # review must never borrow a context left over from a previous
                 # attempt (or another work item).
                 self._last_verify_context = None
+            if dependency_maintenance.is_job(job):
+                outcome = dependency_maintenance.process_one(self, job, token, cfg, files)
+                for name in ('processed', 'records', 'failed'):
+                    result[name] += outcome.get(name, 0)
+                for name in ('ancestor_wait', 'publication_pending', 'stale'):
+                    if outcome.get(name):
+                        result[name] = result.get(name, 0) + 1
+                if outcome.get('budget_wait'):
+                    result['budget_wait'] = True
+                    break
+                continue
             if job.get('pipeline_protocol') == delta_routing.V2_PROTOCOL:
                 # The isolated v2 pipeline owns ALL of its own error, cache and
                 # supersession handling. Run it and skip every legacy v5 branch
@@ -5524,8 +5884,6 @@ class Evolution:
                     # job['attempts'] is the pre-increment value; the generic
                     # path uses the same ceiling (max_attempts-1) for 'retry'.
                     state = 'retry' if job['attempts'] < max_attempts - 1 else 'failed'
-                    self._terminal(job, token, state, error,
-                                   next_at=0 if state == 'retry' else None)
                     with self.engine.transaction():
                         self.db.execute(
                             'UPDATE knowledge_work SET bundle=NULL,proposal=NULL,review=NULL'
@@ -5533,6 +5891,8 @@ class Evolution:
                         self.db.execute(
                             "INSERT INTO knowledge_failures(work_id,state,error,created_at)"
                             " VALUES(?,?,?,?)", (job['id'], state, error, time.time()))
+                        self._terminal(job, token, state, error,
+                                       next_at=0 if state == 'retry' else None)
                     result['failed'] += 1
                     continue
                 committed=self.db.execute('SELECT 1 FROM knowledge_batches WHERE batch_id=? AND project=?',(job['id'],job['project'])).fetchone()
@@ -5552,55 +5912,59 @@ class Evolution:
                 state = 'publication_pending' if committed else ('obsolete' if 'superseded' in str(exc) else ('blocked' if ('source unavailable' in str(exc) or 'source revoked' in str(exc) or 'source missing' in str(exc)) else ('failed' if isinstance(exc,StageLimit) else ('retry' if isinstance(exc,(OSError,RuntimeError,ValueError)) and job['attempts']<max_attempts-1 else 'failed'))))
                 # Every terminal state keeps an audit row so a later successful
                 # retry cannot erase why it once failed.
-                self._terminal(job, token, state, type(exc).__name__+': '+str(exc)[:220],
-                               next_at=(time.time()+60) if state=='retry' else None)
-                dispatched = getattr(self, '_dispatched', 0)
+                # Failure audit, retry feedback and semantic cache invalidation
+                # still need the matching token. Finish them before _terminal
+                # releases a settled failed lease, in this same transaction.
                 with self.engine.transaction():
-                    self.db.execute("INSERT INTO knowledge_failures(work_id,state,error,created_at) VALUES(?,?,?,?)",(job['id'],state,type(exc).__name__+': '+str(exc)[:220],time.time()))
-                    if state == 'blocked' and dispatched == 0:
-                        # A source check that failed before any provider dispatch
-                        # must not consume a retry attempt: refund exactly one
-                        # and keep an audit trail of the refund.
-                        self.db.execute("UPDATE knowledge_work SET attempts=MAX(0,attempts-1) WHERE id=? AND lease_token=?", (job['id'], token))
-                        self.db.execute("INSERT INTO knowledge_failures(work_id,state,error,created_at) VALUES(?,?,?,?)",
-                                        (job['id'], 'attempt_refunded', 'blocked before provider dispatch; attempt refunded', time.time()))
-                # Feed a bounded, safe validation label to the next attempt so
-                # a retry is not blind. A rejected review already stored its
-                # specific findings; do not overwrite them with a generic label.
-                # A transient upstream failure (timeout/provider error/OSError)
-                # leaves the stored material valid, so it must NOT add feedback:
-                # the bundle, counters, read-set and proposal all survive for
-                # the retry. Only a semantic rejection / version / validation
-                # failure starts fresh material with bounded findings.
-                semantic = isinstance(exc, ValueError)
-                category = getattr(exc, 'category', None)
-                if semantic:
-                    try:
-                        bundle = json.loads(self.db.execute('SELECT bundle FROM knowledge_work WHERE id=?', (job['id'],)).fetchone()['bundle'] or 'null')
-                    except (TypeError, ValueError):
-                        bundle = None
-                    if isinstance(bundle, dict):
-                        existing_fb = bundle.get('feedback') or []
-                        if not existing_fb:
-                            bundle['feedback'] = self._bounded_validation_error(exc)
-                            # Host-built structural label, safe to replay.
-                            bundle['feedback_origin'] = FEEDBACK_ORIGIN_HOST
-                            bundle.pop('feedback_envelope', None)
-                            self._write_bundle(job['id'], token, bundle)
-                # The stored proposal/review is a crash-recovery cache, not a
-                # verdict. Replaying it cannot fix a validation failure (a
-                # quote that is not in the source, a reviewer that rejected
-                # the proposal, a version that moved underneath it), so the
-                # retries would burn every attempt without ever asking the
-                # model again. Clear the cache for that class so the next
-                # attempt really re-asks; keep it for transient failures
-                # (timeout/OSError), where the stored answer is still valid.
-                # Never clear a committed batch: its review carries the
-                # consumption checks the recovery path needs. The feedback is
-                # preserved in the bundle so the next compile sees it.
-                if semantic and state != 'publication_pending':
+                    dispatched = getattr(self, '_dispatched', 0)
                     with self.engine.transaction():
-                        self.db.execute('UPDATE knowledge_work SET proposal=NULL,review=NULL WHERE id=? AND lease_token=?', (job['id'], token))
+                        self.db.execute("INSERT INTO knowledge_failures(work_id,state,error,created_at) VALUES(?,?,?,?)",(job['id'],state,type(exc).__name__+': '+str(exc)[:220],time.time()))
+                        if state == 'blocked' and dispatched == 0:
+                            # A source check that failed before any provider dispatch
+                            # must not consume a retry attempt: refund exactly one
+                            # and keep an audit trail of the refund.
+                            self.db.execute("UPDATE knowledge_work SET attempts=MAX(0,attempts-1) WHERE id=? AND lease_token=?", (job['id'], token))
+                            self.db.execute("INSERT INTO knowledge_failures(work_id,state,error,created_at) VALUES(?,?,?,?)",
+                                            (job['id'], 'attempt_refunded', 'blocked before provider dispatch; attempt refunded', time.time()))
+                    # Feed a bounded, safe validation label to the next attempt so
+                    # a retry is not blind. A rejected review already stored its
+                    # specific findings; do not overwrite them with a generic label.
+                    # A transient upstream failure (timeout/provider error/OSError)
+                    # leaves the stored material valid, so it must NOT add feedback:
+                    # the bundle, counters, read-set and proposal all survive for
+                    # the retry. Only a semantic rejection / version / validation
+                    # failure starts fresh material with bounded findings.
+                    semantic = isinstance(exc, ValueError)
+                    category = getattr(exc, 'category', None)
+                    if semantic:
+                        try:
+                            bundle = json.loads(self.db.execute('SELECT bundle FROM knowledge_work WHERE id=?', (job['id'],)).fetchone()['bundle'] or 'null')
+                        except (TypeError, ValueError):
+                            bundle = None
+                        if isinstance(bundle, dict):
+                            existing_fb = bundle.get('feedback') or []
+                            if not existing_fb:
+                                bundle['feedback'] = self._bounded_validation_error(exc)
+                                # Host-built structural label, safe to replay.
+                                bundle['feedback_origin'] = FEEDBACK_ORIGIN_HOST
+                                bundle.pop('feedback_envelope', None)
+                                self._write_bundle(job['id'], token, bundle)
+                    # The stored proposal/review is a crash-recovery cache, not a
+                    # verdict. Replaying it cannot fix a validation failure (a
+                    # quote that is not in the source, a reviewer that rejected
+                    # the proposal, a version that moved underneath it), so the
+                    # retries would burn every attempt without ever asking the
+                    # model again. Clear the cache for that class so the next
+                    # attempt really re-asks; keep it for transient failures
+                    # (timeout/OSError), where the stored answer is still valid.
+                    # Never clear a committed batch: its review carries the
+                    # consumption checks the recovery path needs. The feedback is
+                    # preserved in the bundle so the next compile sees it.
+                    if semantic and state != 'publication_pending':
+                        with self.engine.transaction():
+                            self.db.execute('UPDATE knowledge_work SET proposal=NULL,review=NULL WHERE id=? AND lease_token=?', (job['id'], token))
+                    self._terminal(job, token, state, type(exc).__name__+': '+str(exc)[:220],
+                                   next_at=(time.time()+60) if state=='retry' else None)
                 result['failed'] += 1
                 if category in _TRANSIENT_CATEGORIES:
                     trip = self.breaker_trip(category)
@@ -5640,7 +6004,7 @@ class Evolution:
         from .views import refresh
         try:result['navigation']=refresh(self.engine)
         except OSError as exc:result['navigation_error']=type(exc).__name__
-        result['pending'] = self.db.execute("SELECT COUNT(*) FROM knowledge_work WHERE state IN ('pending','budget_wait','running','retry','publication_pending','coverage_wait','operator_publication_pending')").fetchone()[0]
+        result['pending'] = self.db.execute("SELECT COUNT(*) FROM knowledge_work WHERE tongle_work_process(project,inputs) AND state IN ('pending','budget_wait','running','retry','publication_pending','coverage_wait','operator_publication_pending')").fetchone()[0]
         return result
 
     # ------------------------------------------- source supersession chain
@@ -5838,7 +6202,7 @@ class Evolution:
             if self.db.execute('SELECT value FROM meta WHERE key=?', (marker,)).fetchone() is not None:
                 return {'recovered': 0, 'already_done': True}
             recovered = []
-            for row in self.db.execute("SELECT * FROM knowledge_work WHERE state='failed' AND pipeline_protocol=?", (PROTOCOL_VERSION,)).fetchall():
+            for row in self.db.execute("SELECT * FROM knowledge_work WHERE state='failed' AND pipeline_protocol=? AND tongle_process(project)", (PROTOCOL_VERSION,)).fetchall():
                 job = dict(row)
                 failure = self.db.execute(
                     'SELECT error FROM knowledge_failures WHERE work_id=? ORDER BY created_at DESC LIMIT 1',
@@ -5897,7 +6261,7 @@ class Evolution:
             prior = self.db.execute("SELECT value FROM meta WHERE key=?", (marker,)).fetchone()
             if prior is not None:
                 return {'recovered': 0, 'already_done': True, 'marker': prior[0]}
-            rows = self.db.execute("SELECT * FROM knowledge_work WHERE state NOT IN ('done','obsolete') AND pipeline_protocol=?", (PROTOCOL_VERSION,)).fetchall()
+            rows = self.db.execute("SELECT * FROM knowledge_work WHERE state NOT IN ('done','obsolete') AND pipeline_protocol=? AND tongle_process(project)", (PROTOCOL_VERSION,)).fetchall()
             recovered = []
             routed = []
             for row in rows:

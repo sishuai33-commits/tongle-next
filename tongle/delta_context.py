@@ -647,4 +647,25 @@ def build_live_context(evo, job):
 
     selected = _recall(
         evo, job, source["text"], [r["text"] for r in references], required)
+    # Revoked/unavailable sources can no longer ground anything new. A card
+    # selected for context may still carry provenance tuples that cite such a
+    # source; mark those entries so the contract keeps them frozen in the
+    # snapshot (bytes and binding stay honest) but never inherits them into a
+    # fresh operation's evidence. The marker list is part of the frozen
+    # context, so compile, review-recompile and publication all observe the
+    # exact same exclusion set.
+    for card in selected:
+        if not isinstance(card, dict):
+            continue
+        evidence = card.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        unavailable = [
+            e for e in evidence
+            if isinstance(e, dict)
+            and isinstance(e.get("source_id"), str)
+            and not evo.engine.source_available(e["source_id"])
+        ]
+        if unavailable:
+            card["unavailable_evidence"] = unavailable
     return delta_contract.build_context(window, selected)

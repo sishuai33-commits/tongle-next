@@ -5,9 +5,11 @@ from .engine import digest,SourceUnavailable
 
 
 def queue_synthesis(engine,project,text='整理共同主题、适用条件、限制与分歧'):
+    from .memory_runtime import allowed
+    if not allowed(engine,project):return {'queued':False,'disabled':True,'reason':'memory_only'}
     from .worker import prepare
     prepare(engine)
-    rows=engine.db.execute("SELECT id,current_version FROM sources s WHERE project=? AND kind='document' AND NOT EXISTS(SELECT 1 FROM source_status ss WHERE ss.source_id=s.id AND ss.state!='available') ORDER BY created_at DESC LIMIT 8",(project,)).fetchall()
+    rows=engine.db.execute("SELECT id,current_version FROM sources s WHERE project=? AND tongle_source_process(id,current_version) AND kind='document' AND NOT EXISTS(SELECT 1 FROM source_status ss WHERE ss.source_id=s.id AND ss.state!='available') ORDER BY created_at DESC LIMIT 8",(project,)).fetchall()
     if len(rows)<2:return {'queued':False,'reason':'at least two distinct source documents required'}
     refs=[{'source_id':r['id'],'version':r['current_version']} for r in reversed(rows)]
     jid=digest(json.dumps([project,refs,text],sort_keys=True,ensure_ascii=False))[:32]

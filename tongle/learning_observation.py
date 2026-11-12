@@ -10,6 +10,8 @@ _CORRECTION = re.compile(r"(你.{0,6}(搞错|理解错|弄错)|刚才.{0,12}(不
 
 
 def capture_followup(evolution, source_id, session):
+    from .memory_runtime import source_allowed
+    if not source_allowed(evolution.engine,source_id):return None
     from .evolution import config
     cfg=config(evolution.engine)
     projects=cfg.get('knowledge_learning_projects')

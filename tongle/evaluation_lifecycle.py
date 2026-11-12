@@ -21,7 +21,7 @@ def read(path):
     path = Path(path)
     if path.is_symlink() or path.stat().st_size > 2_000_000:
         raise ValueError('invalid bounded artifact')
-    return json.loads(path.read_text(encoding='utf-8'))
+    return json.loads(path.read_text())
 
 
 def connect(home):
@@ -256,7 +256,7 @@ def inspect_arm(case, root, arm, task, answer):
             actual[c['id']]=c
             if c['key'] in changes:changed_ids.add(c['id'])
         receipts=db.execute('SELECT * FROM knowledge_consumption').fetchall()
-        events=[json.loads(line) for line in (root/'events.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+        events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines() if line.strip()]
         contexts=[e['message'] for e in events if e.get('type')=='message_end' and e.get('message',{}).get('customType')=='tongle-next-context']
         users=[e['message'] for e in events if e.get('type')=='message_end' and e.get('message',{}).get('role')=='user']
         if len(users)!=1 or users[0].get('content') != [{'type':'text','text':task['prompt']}]:

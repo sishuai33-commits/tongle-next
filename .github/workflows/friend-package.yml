@@ -1,0 +1,54 @@
+name: Tongle portable package acceptance
+on:
+  workflow_dispatch:
+  push:
+    branches: ['friend-release-ci-20261112*']
+permissions:
+  contents: read
+jobs:
+  package:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+            pi: .friend-pi/bin/pi
+          - platform: windows-x64
+            runner: windows-2022
+            pi: .friend-pi/pi.cmd
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Package the pinned runtime and current core
+        run: >-
+          python scripts/build_friend_package.py build
+          --platform ${{ matrix.platform }}
+          --to dist/Tongle-${{ matrix.platform }}.zip
+      - name: Verify the ZIP in a clean profile
+        run: >-
+          python tests/friend_package_acceptance.py
+          --zip dist/Tongle-${{ matrix.platform }}.zip
+          --report dist/${{ matrix.platform }}-acceptance.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Pi for the native host test
+        run: npm install --prefix .friend-pi --global @earendil-works/pi-coding-agent@1.5.2 --no-audit --no-fund
+      - name: Verify Pi with a clean profile and a synthetic model endpoint
+        run: >-
+          python tests/friend_pi_acceptance.py
+          --zip dist/Tongle-${{ matrix.platform }}.zip
+          --pi ${{ matrix.pi }}
+          --report dist/${{ matrix.platform }}-pi-acceptance.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tongle-${{ matrix.platform }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error

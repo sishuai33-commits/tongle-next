@@ -126,6 +126,13 @@ CREATE TABLE IF NOT EXISTS redactions (
     created_at TEXT NOT NULL,
     PRIMARY KEY (source_id, version)
 );
+CREATE TABLE IF NOT EXISTS processing_dispositions (
+    source_id  TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    disposition TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, version)
+);
 """
 
 
@@ -316,7 +323,15 @@ class Store:
     # ------------------------------------------------------------- capture
 
     def capture(self, project, session, role, event_id, text):
-        """Persist one conversation event idempotently; returns ack dict."""
+        """Persist one conversation event idempotently; returns ack dict.
+
+        The processing disposition is resolved from this store's own home
+        ``config.json`` at capture time and persisted transactionally with the
+        source/version/event. If mode is memory-only for this project no job
+        is created; a replay keeps the original disposition even if the
+        current mode has since changed.
+        """
+        from . import memory_policy as _mp
         _require_str(project, "project")
         _require_str(session, "session")
         _require_str(role, "role")
@@ -324,6 +339,11 @@ class Store:
         _require_str(text, "text")
         if role not in ("user", "assistant"):
             raise ValueError(f"role must be 'user' or 'assistant', got {role!r}")
+        # Validate policy BEFORE mutating: invalid mode/project config must
+        # fail explicitly rather than fall through to processing enabled.
+        disposition = _mp.capture_disposition(
+            _mp.read_home_config(self.home), project)
+        allowed = _mp.admission_for(disposition)
         # Credential literals never enter the ledger (capture-boundary choke
         # point; see _redact above). Applied before the idempotence hash so
         # replays of the same original still dedup identically. The redaction
@@ -351,8 +371,22 @@ class Store:
                     " ORDER BY created_at, id LIMIT 1",
                     (row["source_id"],),
                 ).fetchone()
+                stored = db.execute(
+                    "SELECT disposition FROM processing_dispositions"
+                    " WHERE source_id=? AND version=1",
+                    (row["source_id"],),
+                ).fetchone()
+                # Legacy row without a disposition: report its actual
+                # processing history instead of fabricating a current-mode
+                # disposition. Never reclassify it.
+                if stored:
+                    replay_disposition = stored["disposition"]
+                else:
+                    replay_disposition = ("processing" if job
+                                          else "memory")
                 return {"source_id": row["source_id"], "version": 1,
                         "event_id": event_id,
+                        "disposition": replay_disposition,
                         "job_id": job["id"] if job else None}
             sid = uuid.uuid4().hex
             original = text.encode("utf-8")
@@ -381,20 +415,41 @@ class Store:
                     (sid, role, ",".join(sorted(redactions)),
                      sum(redactions.values()), now),
                 )
-            jid = uuid.uuid4().hex
             db.execute(
-                "INSERT INTO jobs(id, source_id, version, created_at)"
-                " VALUES(?,?,1,?)",
-                (jid, sid, now),
+                "INSERT INTO processing_dispositions"
+                "(source_id, version, disposition, created_at)"
+                " VALUES(?,1,?,?)",
+                (sid, disposition, now),
             )
+            jid = None
+            if allowed:
+                jid = uuid.uuid4().hex
+                db.execute(
+                    "INSERT INTO jobs(id, source_id, version, created_at)"
+                    " VALUES(?,?,1,?)",
+                    (jid, sid, now),
+                )
         return {"source_id": sid, "version": 1, "event_id": event_id,
-                "job_id": jid}
+                "disposition": disposition, "job_id": jid}
 
     # -------------------------------------------------------------- ingest
 
-    def ingest(self, project, path, source_id=None):
-        """Ingest a document (.md/.txt/.docx); versioned, idempotent by bytes."""
+    def ingest(self, project, path, source_id=None, *, acquisition=None, acquisition_path=None, expected_hash=None):
+        """Ingest a document (.md/.txt/.docx); versioned, idempotent by bytes.
+
+        The disposition is resolved from this store's own home ``config.json``
+        and captured with the new version transactionally; memory-only
+        projects never get a job.
+        """
+        from . import memory_policy as _mp
         _require_str(project, "project")
+        if acquisition is not None:
+            from .source_acquisition import validate_manifest, prepare, record, _text
+            acquisition = validate_manifest(acquisition)
+            _text(acquisition_path, 'acquisition_path', 4096)
+        disposition = _mp.capture_disposition(
+            _mp.read_home_config(self.home), project)
+        allowed = _mp.admission_for(disposition)
         if not os.path.islink(path):
             resolved = os.path.realpath(os.fspath(path))
         else:
@@ -422,6 +477,8 @@ class Store:
         else:
             sid = _require_str(source_id, "source_id")
         digest = _sha256_hex(original)
+        if expected_hash is not None and digest != expected_hash:
+            raise ValueError('source bytes changed before ingestion')
         now = _now()
         with self.transaction() as db:
             row = db.execute(
@@ -431,21 +488,42 @@ class Store:
                 " WHERE s.id=?",
                 (sid,),
             ).fetchone()
+            if row is not None and (row['project'] != project or row['kind'] != 'document'):
+                raise ValueError(f"source id {sid!r} collision: belongs to"
+                                 f" project={row['project']!r} kind={row['kind']!r}")
+            if acquisition is None and db.execute("SELECT 1 FROM sqlite_master WHERE name='source_acquisitions'").fetchone():
+                if db.execute('SELECT 1 FROM source_acquisitions WHERE source_id=? LIMIT 1', (sid,)).fetchone():
+                    raise ValueError('acquired source requires an explicit acquisition receipt for updates')
+            if acquisition is not None:
+                replay = prepare(db, project, sid, digest, acquisition, acquisition_path, row)
+                if replay is not None:
+                    return replay
             if row is not None:
-                if row["project"] != project or row["kind"] != "document":
-                    raise ValueError(
-                        f"source id {sid!r} collision: belongs to"
-                        f" project={row['project']!r} kind={row['kind']!r}"
-                    )
+                db.execute("UPDATE sources SET original_path=? WHERE id=?", (resolved, sid))
                 if row["hash"] == digest:  # identical bytes: idempotent
                     job = db.execute(
                         "SELECT id FROM jobs WHERE source_id=? AND version=?"
                         " ORDER BY created_at, id LIMIT 1",
                         (sid, row["current_version"]),
                     ).fetchone()
-                    return {"source_id": sid,
+                    stored = db.execute(
+                        "SELECT disposition FROM processing_dispositions"
+                        " WHERE source_id=? AND version=?",
+                        (sid, row["current_version"]),
+                    ).fetchone()
+                    # Legacy row without a disposition: report its actual
+                    # processing history, never reclassify or write a row.
+                    if stored:
+                        replay_disposition = stored["disposition"]
+                    else:
+                        replay_disposition = ("processing" if job
+                                              else "memory")
+                    result = {"source_id": sid,
                             "version": row["current_version"],
+                            "disposition": replay_disposition,
                             "job_id": job["id"] if job else None}
+                    return (record(db, project, sid, digest, acquisition, acquisition_path,
+                                   result, False, now) if acquisition is not None else result)
                 version = row["current_version"] + 1
                 db.execute(
                     "UPDATE sources SET current_version=? WHERE id=?",
@@ -465,12 +543,20 @@ class Store:
                 " hash, created_at) VALUES(?,?,?,?,?,?)",
                 (sid, version, text, original, digest, now),
             )
-            jid = uuid.uuid4().hex
             db.execute(
-                "INSERT INTO jobs(id, source_id, version, created_at)"
+                "INSERT INTO processing_dispositions"
+                "(source_id, version, disposition, created_at)"
                 " VALUES(?,?,?,?)",
-                (jid, sid, version, now),
+                (sid, version, disposition, now),
             )
+            jid = None
+            if allowed:
+                jid = uuid.uuid4().hex
+                db.execute(
+                    "INSERT INTO jobs(id, source_id, version, created_at)"
+                    " VALUES(?,?,?,?)",
+                    (jid, sid, version, now),
+                )
             if version > 1:  # stale-mark prior-version records, keep withdrawn/superseded
                 db.execute(
                     "UPDATE records SET status='stale'"
@@ -478,7 +564,45 @@ class Store:
                     "   AND status NOT IN ('withdrawn','superseded')",
                     (sid, version),
                 )
-        return {"source_id": sid, "version": version, "job_id": jid}
+            result = {"source_id": sid, "version": version,
+                      "disposition": disposition, "job_id": jid}
+            if acquisition is not None:
+                result = record(db, project, sid, digest, acquisition, acquisition_path,
+                                result, True, now)
+        return result
+
+    def admission(self, source_id, version):
+        """Whether persisted source/version may enter semantic processing.
+
+        * Returns False when the capture-time disposition was ``memory``.
+        * Returns True for a real existing source/version that has no
+          disposition row (pre-schema data): it is grandfathered as
+          processable rather than crashing every legacy source.
+        * Raises KeyError for an unknown source/version.
+
+        Current project policy is checked separately by callers.
+        """
+        _require_str(source_id, "source_id")
+        if isinstance(version, bool) or not isinstance(version, int) \
+                or version < 1:
+            raise ValueError("version must be a positive integer")
+        row = self.db.execute(
+            "SELECT disposition FROM processing_dispositions"
+            " WHERE source_id=? AND version=?",
+            (source_id, version),
+        ).fetchone()
+        from . import memory_policy as _mp
+        if row is not None:
+            return _mp.admission_for(row["disposition"])
+        # No disposition: grandfather only a real persisted source/version.
+        existing = self.db.execute(
+            "SELECT 1 FROM versions WHERE source_id=? AND version=?",
+            (source_id, version),
+        ).fetchone()
+        if existing is None:
+            raise KeyError(
+                "unknown source/version %r v%d" % (source_id, version))
+        return True
 
     # -------------------------------------------------------------- access
 

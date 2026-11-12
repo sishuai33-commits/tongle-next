@@ -5,6 +5,7 @@ from pathlib import Path
 from .knowledge_store import KnowledgeStore
 from .knowledge_files import KnowledgeFiles
 from .presentation import label
+from .memory_policy import read_home_config
 
 _BEIJING=timezone(timedelta(hours=8))
 
@@ -52,7 +53,7 @@ def status_snapshot(engine,counts):
  # full reservation while in flight, bounded nominal for finished-unknown.
  from .evolution import _int_or
  cfg_path=engine.home/'config.json'
- cfg=json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.is_file() else {}
+ cfg=json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
  nominal=max(0,_int_or(cfg.get('knowledge_unknown_nominal_tokens'),40000))
  finished_unknown=[r for r in unknown if r['elapsed'] is not None]
  in_flight=[r for r in unknown if r['elapsed'] is None]
@@ -237,7 +238,7 @@ def refresh(engine):
    for p in paths:body+='> - [['+p.as_posix()[:-3]+'|'+p.stem.replace('|',' ')+']]\n'
    body+='\n'
   pages[folder+'/总览.md']=body
- pages['使用说明.md']=GUIDE
+ pages['使用说明.md']=MEMORY_GUIDE if read_home_config(engine.home).get('knowledge_mode')=='memory' else GUIDE
  snap=status_snapshot(engine,counts)
  oldest=('未记录' if snap['oldest_age'] is None else f"{int(snap['oldest_age']//3600)} 小时")
  next_retry=snap['next_retry'] or '无'
@@ -303,7 +304,7 @@ def refresh(engine):
     import tempfile,os
     fd,temp=tempfile.mkstemp(dir=target.parent,prefix='.tongle-view-')
     try:
-     with os.fdopen(fd,'w',encoding='utf-8',newline='') as f:f.write(body);f.flush();os.fsync(f.fileno())
+     with os.fdopen(fd,'wb') as f:f.write(body.encode('utf-8'));f.flush();os.fsync(f.fileno())
      actual=hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
      if actual!=h:conflicts.append(rel);continue
      if old is None:os.link(temp,target)
@@ -362,4 +363,43 @@ GUIDE='''# 使用说明
 查看 [[运行情况]]。提供过知识、实际产物中正确应用、相对不用知识是否改善，是三个不同证据等级。不会因为检索命中或模型自称采用，就记成成功。
 
 导出备份包含正文、身份、版本与来源账本。恢复后模型调用默认关闭，需核对目标端的授权与配置再恢复维护。实际订阅扣费以供应商账单为准。
+'''
+
+MEMORY_GUIDE='''# 使用说明
+
+从 [[首页]] 看项目和知识。当前业务以项目原件及明确决定为准；这里保存接续入口和有出处、可修订的判断。
+
+## 平时怎么用
+
+在已接通的终端正常做事即可。有价值的一项工作收尾时，当前 AI 负责先找已有认识，再决定新增经验卡、综合 Wiki、修订原卡，或不新增。无需每轮提醒“记住”。Pi 扩展更新后，已有会话需重新加载扩展或重开；每端实际接通情况以验收记录为准，配置存在不证明生效。
+
+新对话只在相关主题和条件下借用知识，无明确主题时可以不提供。长卡提供读取入口；依赖其结论前应展开正文与条件，需要原话、数字、争议依据时定点回读。AI 仍可能漏存、误用或误判，重要结论应核对实际来源。
+
+当前是全局 memory 模式：由正在工作的 AI 做有限整理，不再将每轮对话交给旧后台编译或递归综合。原文保存、人工编辑同步、纠正和备份继续由现有维护机制负责；没有新建常驻服务。普通复用问答不要求额外写卡，材料保存也不等于已经形成经验。
+
+## 资产放在哪里
+
+- **项目**：当前决定、理由、未决事项与原件入口。后续更正优先维护原项目接续。
+- **知识**：经验卡保存判断、理由、适用条件与例外；Wiki 解释多份材料之间的关系和不同情境下的选择。模型综合标为推论/假设，不当作已验证事实。
+- **资料**：材料及其来源说明；原始来源版本还保存在本地账本。已登记资料可回读，未登记文件不会被猜测项目并静默导入。
+- **随笔**：复盘、观察和待验证想法。
+- **归档**：退出当前使用的版本与历史依据，不按年龄删除。
+
+旧资产保持原位，不全库重写。受管卡可在这五个目录间移动，保留文末隐藏身份标记。跨项目读取只按已有授权范围进行，不把业务动态变成全局规则。
+
+## 修改与纠错
+
+可以在 Obsidian 修改正文或移动卡片，保留文末隐藏身份标记。人工修改受保护，旧版本写入不能覆盖新编辑。若发生冲突，系统保留待处理结果，不伪报保存成功。
+
+遇到反例时，当前 AI 可用新的有效来源修订自己写的、未被人工修改的假设。精确局部修订保留未修改的正文、条件、旧证据和历史版本；无法安全修订时保留待处理。用户决定、人工补充及范围继续受保护。
+
+有效纠正先影响消费，无需等待卡片改写；撤回来源和纠正仍沿证据关系检查有效性。普通导航链接不会触发连锁重写，旧后台递归更新不在当前模式运行。
+
+## 查看实际效果
+
+查看 [[运行情况]]，并核对实际产物。提供过知识、实际正确应用、相对不用知识是否改善，是不同证据等级。引用次数或模型自称采用不表示真的帮上忙；历史维护记录不代表当前正在运行后台整理。
+
+经验卡和 Wiki 中已附的真实资料链接可用于打开对应材料；仅在来源账本中的聊天原文通过 AI 定点回读，没有独立聊天浏览界面。来源链接是导航，不能代替来源版本和证据身份，也不保证每份旧资料已有可点击链接。
+
+导出备份包含正文、身份、版本与来源账本。恢复前先保存当前库，不用旧数据库覆盖新增对话和纠正；回退需保留兼容的读取保护。恢复后模型调用默认关闭，核对目标端授权与配置后再启用所需能力。
 '''

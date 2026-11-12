@@ -224,8 +224,26 @@ def _normalize_edits(edits):
         if not isinstance(seg_id, str) or not seg_id:
             raise _CardError("edit segment_id must be a non-empty string")
         text = _require_nonempty_str(edit.get("text"), "edit text")
-        if seg_id in seen_targets:
-            raise _CardError("each segment may be targeted at most once")
+        # A segment accepts at most one structural rewrite: any duplicate
+        # targeting that involves a ``replace`` is ambiguous (two replacement
+        # texts, or replace+insert ordering of rewritten bytes) and stays
+        # rejected. A pure ``insert_after`` chain on one segment is
+        # well-defined -- apply_delta appends the texts in the given order --
+        # so appending several paragraphs to the same segment is legal. An
+        # exact verbatim duplicate insert on the same segment is rejected as
+        # an almost-certain model glitch rather than a deliberate repetition.
+        prev_op = seen_targets.get(seg_id)
+        if prev_op is not None and (op == "replace" or prev_op == "replace"):
+            raise _CardError(
+                "a segment may be replaced at most once, and replace cannot be "
+                "combined with insert_after on the same segment"
+            )
+        if prev_op is not None and any(
+            prev_text == text
+            for prev_seg, _prev_op, prev_text in cleaned
+            if prev_seg == seg_id
+        ):
+            raise _CardError("duplicate insert_after with identical text on one segment")
         seen_targets[seg_id] = op
         cleaned.append((seg_id, op, text))
     return cleaned

@@ -22,11 +22,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
 import tempfile
 import time
+import uuid
 
 MARKER = "tongle-next"
 ADAPTERS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,7 +70,7 @@ def check_config_dir(path, allow_external):
 ADAPTER_ID_ARG = "--adapter-id=tongle-next"
 
 
-def _is_owned_handler(handler):
+def _is_owned_handler(handler, entrypoint=None):
     """Exact ownership: our hook.py path plus the --adapter-id=tongle-next
     argument. A foreign command that merely mentions the product name (e.g.
     `echo check-tongle-next-availability`) is NOT ours and must survive
@@ -76,15 +78,22 @@ def _is_owned_handler(handler):
     if not isinstance(handler, dict) or handler.get("type") != "command":
         return False
     args = handler.get("args")
-    if isinstance(args, list) and HOOK_PY in args and ADAPTER_ID_ARG in args:
-        return True
     command = handler.get("command")
-    if isinstance(command, str) and "args" not in handler:
+    if isinstance(command,str):
         try:
-            parts = shlex.split(command)
-        except ValueError:
+            if 'args' in handler:
+                if not isinstance(args,list) or not all(isinstance(x,str) for x in args):return False
+                parts=[command,*args]
+            else:parts=shlex.split(command)
+        except ValueError:return False
+        if parts and parts[0] in ('env','/usr/bin/env'):
+            parts=parts[1:]
+            while parts and re.fullmatch('[A-Za-z_][A-Za-z_0-9]*=.*',parts[0],re.S):parts=parts[1:]
+        if not parts or not os.path.isabs(parts[0]) or not re.fullmatch(r'python(?:\d+(?:\.\d+)*)?',os.path.basename(parts[0])):
             return False
-        return HOOK_PY in parts and ADAPTER_ID_ARG in parts
+        if entrypoint:
+            return parts[1:]==[entrypoint,'hook',ADAPTER_ID_ARG,'--host=codex']
+        return parts[1:] in ([HOOK_PY,ADAPTER_ID_ARG],[HOOK_PY,ADAPTER_ID_ARG,'--host=codex'])
     return False
 
 
@@ -141,10 +150,10 @@ def merge_cc(existing, fragment):
     return merged
 
 
-def unmerge_cc(existing):
+def unmerge_cc(existing, entrypoint=None):
     merged = json.loads(json.dumps(existing)) if isinstance(existing, dict) else {}
     env = merged.get("env")
-    if isinstance(env, dict):
+    if isinstance(env, dict) and entrypoint is None:
         for key in ENV_KEYS:
             env.pop(key, None)
         if not env:
@@ -160,7 +169,7 @@ def unmerge_cc(existing):
                 if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                     kept.append(group)
                     continue
-                foreign = [h for h in group["hooks"] if not _is_owned_handler(h)]
+                foreign = [h for h in group["hooks"] if not _is_owned_handler(h, entrypoint)]
                 if foreign:
                     group["hooks"] = foreign
                     kept.append(group)
@@ -176,8 +185,17 @@ def unmerge_cc(existing):
 # ------------------------------------------------------------- Codex -------
 
 def codex_fragment(args):
-    command = "%s %s %s --host=codex" % (
-        shlex.quote(args.python), shlex.quote(HOOK_PY), ADAPTER_ID_ARG)
+    entrypoint=getattr(args,'entrypoint',None)
+    if entrypoint:
+        command=shlex.join([args.python,entrypoint,'hook',ADAPTER_ID_ARG,'--host=codex'])
+    else:
+        # Codex does not consume CC's top-level `env` object. Bind the actual
+        # instance in the command, including safe quoting of spaces/metacharacters.
+        bindings=_env_block(args)
+        if 'TONGLE_NEXT_PROJECT' in bindings:
+            bindings['TONGLE_NEXT_DEFAULT_PROJECT']=bindings.pop('TONGLE_NEXT_PROJECT')
+        command=shlex.join(['env',*[key+'='+value for key,value in bindings.items()],
+                            args.python,HOOK_PY,ADAPTER_ID_ARG,'--host=codex'])
     hooks = {}
     for event, timeout in CODEX_EVENTS.items():
         hooks[event] = [{
@@ -195,7 +213,7 @@ def codex_fragment(args):
     }
 
 
-def merge_codex(existing, fragment):
+def merge_codex(existing, fragment, entrypoint=None):
     merged = json.loads(json.dumps(existing)) if isinstance(existing, dict) else {}
     # Preserve a foreign description; only set ours on a fresh/owned file.
     if not merged.get("description"):
@@ -208,7 +226,15 @@ def merge_codex(existing, fragment):
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                 continue
             for i, h in enumerate(group["hooks"]):
-                if _is_owned_handler(h):
+                legacy_match=False
+                if entrypoint and _is_owned_handler(h):
+                    # A different instance can share this checkout/config file.
+                    # Migrate only a legacy command explicitly bound to OUR home.
+                    try:
+                        bound_home=os.path.dirname(os.path.dirname(entrypoint))
+                        legacy_match=('TONGLE_NEXT_HOME='+bound_home) in shlex.split(h.get('command',''))
+                    except ValueError:pass
+                if _is_owned_handler(h,entrypoint) or legacy_match:
                     group["hooks"][i] = groups[0]["hooks"][0]
                     replaced = True
         if not replaced:
@@ -272,6 +298,12 @@ def load_json_or_empty(path):
         raise InstallError("%s is not valid JSON: %s" % (path, exc))
 
 
+def _read_bytes_or_none(path):
+    try:
+        with open(path,'rb') as source:return source.read()
+    except FileNotFoundError:return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -282,6 +314,7 @@ def main(argv=None):
     parser.add_argument("--root", default=os.path.dirname(ADAPTERS_DIR),
                         help="absolute tongle-next repo root (contains the tongle package)")
     parser.add_argument("--project", help="optional default project (else per-cwd .tongle-next.json)")
+    parser.add_argument("--entrypoint", help="optional absolute instance-owned stable dispatcher")
     parser.add_argument("--ingest-root", action="append", default=[],
                         help="explicit absolute source root for optional PostToolUse ingestion (cc)")
     parser.add_argument("--write", action="store_true", help="apply changes (default: dry-run)")
@@ -296,6 +329,8 @@ def main(argv=None):
     for root in args.ingest_root:
         if not os.path.isabs(root):
             raise InstallError("--ingest-root must be absolute: %r" % root)
+    if args.entrypoint and (not os.path.isabs(args.entrypoint) or not os.path.isfile(args.entrypoint)):
+        raise InstallError('--entrypoint must be an existing absolute dispatcher path')
 
     if args.host == "pi":
         print(pi_instructions(args))
@@ -314,8 +349,13 @@ def main(argv=None):
         fragment = codex_fragment(args)
         merge, unmerge = merge_codex, unmerge_codex
 
+    if os.path.islink(target):raise InstallError('configuration symlink rejected')
+    before=_read_bytes_or_none(target)
     existing = load_json_or_empty(target)
-    new_data = unmerge(existing) if args.uninstall else merge(existing, fragment)
+    if args.host=='codex':
+        new_data=unmerge(existing,entrypoint=args.entrypoint) if args.uninstall else merge(existing,fragment,entrypoint=args.entrypoint)
+    else:
+        new_data = unmerge(existing) if args.uninstall else merge(existing, fragment)
     changed, new_text = plan_file(target, new_data)
 
     action = "uninstall" if args.uninstall else "install"
@@ -332,13 +372,16 @@ def main(argv=None):
         return 0
 
     os.makedirs(config_dir, exist_ok=True)
+    if os.path.islink(target) or _read_bytes_or_none(target)!=before:
+        raise InstallError('configuration changed during install; retry')
     if os.path.exists(target):
-        backup = "%s.bak-%s" % (target, time.strftime("%Y%m%d-%H%M%S"))
+        backup = "%s.bak-%s-%s" % (target, time.strftime("%Y%m%d-%H%M%S"),time.time_ns())
         shutil.copy2(target, backup)
         print("backup written: %s" % backup)
-    tmp = target + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
+    tmp = target + ".tmp-"+uuid.uuid4().hex
+    with open(tmp, "x", encoding="utf-8") as fh:
+        os.chmod(tmp,0o600)
+        fh.write(new_text);fh.flush();os.fsync(fh.fileno())
     os.replace(tmp, target)
     print("%s %s applied to %s" % (args.host, action, target))
     if not args.uninstall:

@@ -10,7 +10,7 @@ from pathlib import Path
 from .portability import fsync_directory
 
 _H1_RE = re.compile(r"^#\s+", re.MULTILINE)
-_META_RE = re.compile(r"\A---(?:\r?\n).*?(?:\r?\n)---(?:\r?\n)", re.DOTALL)
+_META_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 _ID_RE = re.compile(r"tongle-card: \{.*\}")
 _MAX_SCAN = 2 * 1024 * 1024
 
@@ -19,7 +19,7 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-_WRAPPER = re.compile(r'(?:\r?\n){2}%%\r?\ntongle-card: (\{[^\r\n]*\})\r?\n%%(?:\r?\n)?\Z')
+_WRAPPER = re.compile(r'\n\n%%\ntongle-card: (\{[^\n]*\})\n%%\n?\Z')
 
 
 def _parse_wrapper(text):
@@ -33,9 +33,8 @@ def _parse_wrapper(text):
 
 
 def _strip_wrapper(text):
-    if _parse_wrapper(text) is None:return text
     m=_WRAPPER.search(text)
-    return text[:m.start()] if m else text
+    return text[:m.start()] if m and _parse_wrapper(text) else text
 
 
 class KnowledgeFiles:
@@ -126,7 +125,7 @@ class KnowledgeFiles:
             proj = card.get("project") or ""
             prior={Path(c['path']).parts[1] for c in self.cards.list(proj,include_inactive=True) if c.get('path') and c['path'].startswith('项目/') and len(Path(c['path']).parts)>2}
             cfgpath=self.engine.home/'config.json'
-            cfg=json.loads(cfgpath.read_text(encoding='utf-8')) if cfgpath.is_file() else {}
+            cfg=json.loads(cfgpath.read_text()) if cfgpath.is_file() else {}
             names=cfg.get('knowledge_project_names',{})
             name=names.get(proj,proj) if isinstance(names,dict) else proj
             folder=next(iter(prior)) if len(prior)==1 else self.label(name if re.search(r"[\u4e00-\u9fff]",str(name)) else '项目·'+str(name))
@@ -135,6 +134,14 @@ class KnowledgeFiles:
             topic = card.get("topic") or ""
             folder = self.label(topic) if re.search(r"[\u4e00-\u9fff]", topic) else "其他主题"
             base = "知识/{}/{}.md".format(folder, title)
+        # New explicit content roles share one directory policy. Existing paths
+        # never reach this allocator and therefore keep identity and placement.
+        if self.engine.db.execute("SELECT 1 FROM sqlite_master WHERE name='organization_cards'").fetchone():
+            mapped = self.engine.db.execute('SELECT 1 FROM organization_cards WHERE card_id=?', (card['id'],)).fetchone()
+            if mapped:
+                from .knowledge_organization import KnowledgeOrganization
+                project_label = folder if card.get('kind') == 'memory' else None
+                base = KnowledgeOrganization(self.engine,self.cards).directory(card,project_label) + '/' + title + '.md'
         candidate = base
         n = 1
         while candidate.casefold() in taken:
@@ -299,7 +306,7 @@ class KnowledgeFiles:
             for row in self.engine.db.execute("SELECT path FROM knowledge_files"):
                 if row[0]:
                     taken.add(row[0].casefold())
-            for base in ("知识", "项目", "归档"):
+            for base in (("知识", "项目", "资料", "随笔", "归档") if any(not c.get("path") for c in cards) else ()):
                 d = self.root / base
                 if d.is_dir() and not d.is_symlink():
                     for p in d.rglob("*.md"):
@@ -417,7 +424,7 @@ class KnowledgeFiles:
 
     def _scan(self):
         found = {}
-        for base in ("知识", "项目", "归档"):
+        for base in ("项目", "知识", "资料", "随笔", "归档"):
             d = self.root / base
             if not d.is_dir() or d.is_symlink():
                 continue
@@ -550,19 +557,33 @@ class KnowledgeFiles:
             except (ValueError, OSError):
                 result.setdefault('link_conflicts', []).append(card['id'])
 
-    def sync(self):
+    def sync(self, card_ids=None):
         result = {"changed": 0, "moved": 0, "missing": [], "conflicts": []}
         with self.engine.locked():
-            self.recover()
+            self.recover(card_ids)
             with self.engine.transaction():
                 self.engine.db.execute('CREATE TABLE IF NOT EXISTS knowledge_link_moves '
                                        '(card_id TEXT,old_path TEXT,PRIMARY KEY(card_id,old_path))')
-            found = self._scan()
-            rows = self.engine.db.execute(
-                "SELECT card_id, file_hash, version, path, state"
-                " FROM knowledge_files").fetchall()
+            if card_ids is None:
+                found = self._scan()
+                rows = self.engine.db.execute("SELECT card_id,file_hash,version,path,state FROM knowledge_files").fetchall()
+            else:
+                ids = tuple(dict.fromkeys(card_ids))
+                rows = self.engine.db.execute("SELECT card_id,file_hash,version,path,state FROM knowledge_files WHERE card_id IN ("+','.join('?' for _ in ids)+')', ids).fetchall() if ids else []
+                # A moved candidate is withheld until the maintenance inventory
+                # discovers its new location. Never scan the Vault during recall.
+                found = {}
+                for r in rows:
+                    try:
+                        if self._safe_target(r['path']).is_file():
+                            found[r['card_id']] = [r['path']]
+                    except (ValueError, OSError):
+                        pass
             for row in rows:
                 cid, fhash, ver, rel, state = row
+                if card_ids is not None and state == 'conflict':
+                    result['conflicts'].append(cid)
+                    continue
                 try:
                     card = self.cards.get(cid)
                 except ValueError:
@@ -628,7 +649,7 @@ class KnowledgeFiles:
                     continue
                 human = _strip_wrapper(text)
                 expected_human = _strip_wrapper(self.render(card))
-                if human.replace('\r\n','\n') == expected_human.replace('\r\n','\n'):
+                if human == expected_human:
                     self.engine.db.execute(
                         "UPDATE knowledge_files SET file_hash = ?,"
                         " version = ?, state='ok' WHERE card_id = ?",
@@ -646,7 +667,8 @@ class KnowledgeFiles:
                     (_sha(text), ver, cid))
                 self.engine.db.commit()
                 result["changed"] += 1
-            self._repair_moved_links(result)
+            if card_ids is None:
+                self._repair_moved_links(result)
         for cid in result['conflicts']:self._flag(cid,'conflict')
         for cid in result['missing']:self._flag(cid,'missing')
         return result

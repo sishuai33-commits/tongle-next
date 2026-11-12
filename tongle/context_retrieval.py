@@ -70,7 +70,7 @@ from .evidence_selection import terms
 # learned from test answers or from the corpus.
 CONSUMER_GENERIC = {
     "方案", "计划", "项目", "问题", "情况", "状态", "内容", "效果", "交互",
-    "准备", "需求", "设计", "开发", "测试", "工作", "流程", "功能", "方式",
+    "准备", "需求", "设计", "开发", "测试", "验证", "工作", "流程", "功能", "方式",
     "方法", "结果", "总结", "说明", "文档", "系统", "数据", "信息", "时间",
     "用户", "卡片", "知识", "推送", "开头", "每轮", "最新", "相关", "进行",
     "继续", "当前", "以后", "现在", "一些", "一下", "如何", "怎样", "什么",
@@ -277,6 +277,11 @@ _ACK_PREFIX_PARTS = (
     "请", "麻烦", "劳烦", "烦请", "现在", "先", "那", "那么", "那就",
     "我们", "我", "你", "您", "第一句", "首句", "这一句", "这句",
     "这条消息", "此条消息", "本条消息", "该条消息", "这条", "此条",
+    # Current-turn scope is a bounded lead, not a substantive question. Without
+    # it, an ack such as 本轮只确认收到 can incorrectly override a following
+    # explicit no-history clause. Concrete prefixes/suffixes still fail the
+    # whole-clause check; quoted text remains inert.
+    "本轮", "这轮", "这一轮", "本次", "这次", "这一次",
 )
 _ACK_PREFIX_RE = re.compile(
     r'^(?:[\s，,。:：、]|' + '|'.join(re.escape(p) for p in _ACK_PREFIX_PARTS)
@@ -729,16 +734,34 @@ def is_referential_followup(text):
     return not _frame_residual(stripped)
 
 
+# A few function words are masked before CJK bigrams are cut.  Without this,
+# "并发已经验证了吗" yields the cross-boundary bigrams "发已"/"经验"/"证了"/
+# "了吗": "经验" then matches an unrelated card body and admits it as if the
+# query were about experience.  Only query-side terms are masked; card terms
+# and the shared lexical primitives remain untouched.
+_QUERY_BOUNDARY_WORDS = ("已经",)
+_QUERY_FINAL_PARTICLES = re.compile(r'[了吗呢吧啊]+(?=[\s，。？！,?!]|$)')
+
+
+def _mask_query_function_words(text):
+    for word in _QUERY_BOUNDARY_WORDS:
+        text = text.replace(word, ' ')
+    return _QUERY_FINAL_PARTICLES.sub(' ', text)
+
+
 def specific_terms(text):
-    """Query terms after removing the bounded consumer stopwords.
+    """Query terms after removing bounded stopwords and crossing bigrams.
 
     The requested discussion is separated from inert output-format/schema/label
     spans first, so a schema field name can never become a consumer term. The
     bounded ordinary English function/action/format vocabulary is removed too,
     so an instruction-only English turn (``please explain compare``) has no
     specific terms and cannot summon a card that merely repeats those verbs.
+    A small bounded function-word mask runs before terms() so a CJK bigram
+    cannot straddle a particle/function-word boundary and become a false
+    subject (``已经`` + ``验证`` -> ``经验``).
     """
-    return terms(discussion_text(text)) - CONSUMER_GENERIC - _ORDINARY_ENGLISH
+    return terms(_mask_query_function_words(discussion_text(text))) - CONSUMER_GENERIC - _ORDINARY_ENGLISH
 
 
 def card_terms(card):
@@ -1115,19 +1138,15 @@ def _same_subject_expansion(direct, strong, subject_terms, subject_phrases=None)
     return chosen
 
 
-def recover_subject_cards(cards, turns, is_own_lookup):
-    """Cards of the nearest substantive same-session subject, or ``[]``.
+def recover_subject_cards(cards, turns, is_own_lookup, on_recovered=None):
+    """Recover the nearest concrete subject using the direct-query resolver.
 
-    ``turns`` is a bounded, oldest-first ``(text, created_at, source_id)`` list.
-    Walking newest first, the first turn with an identifiable concrete subject
-    decides recovery: explicit identifier evidence first (known, or an explicit
-    *unknown* that blanks), then a heading-level subject match. A long recent
-    generic turn names no subject, so it can never crowd out the genuine earlier
-    topic, and a closer different subject overrides an older one. The *same*
-    subject constraint as direct retrieval applies, so weak body overlaps never
-    ride along.
+    A loose heading bigram alone cannot replace the current thread's subject.
+    ``on_recovered`` receives the actual positive anchor text, so callers can
+    apply their final relevance gate without using a topic-free follow-up.
+    An explicit unknown subject stops recovery rather than borrowing an older
+    one. The supplied cards and bounded, oldest-first turns retain their scope.
     """
-    is_own = is_own_lookup
     for raw_text, _created, _sid in reversed(list(turns or ())):
         interp = interpret_request(raw_text)
         if (interp.ack_only or interp.no_history
@@ -1137,25 +1156,12 @@ def recover_subject_cards(cards, turns, is_own_lookup):
         spec = specific_terms(text)
         if not spec:
             continue
-        ids = subject_identifiers(text, cards)
-        direct = rank_consumer(cards, text, spec, is_own, identity='')
-        if ids:
-            named = [card for card in direct if _card_words(card) & ids]
-            if named:
-                return named
-            strict, _acronyms = query_identifier_sets(text)
-            if strict:
-                # The nearest turn names an explicit unknown subject: never
-                # carry an unrelated older one.
-                return []
-            continue
-        strong = [card for card in direct if _is_strong_topic(card, text, spec)]
-        if strong:
-            strong_terms = set()
-            for card in strong:
-                strong_terms |= spec & heading_terms(card)
-            return _same_subject_expansion(direct, strong, strong_terms)
-        # A generic / format-only turn names no subject: try an older turn.
+        direct = rank_consumer(cards, text, spec, is_own_lookup, identity='')
+        selected = _select_explicit_subject(cards, text, direct)
+        if selected is not None:
+            if selected and on_recovered is not None:
+                on_recovered(text)
+            return selected
     return []
 
 
@@ -1340,6 +1346,7 @@ def _cjk_heading_matches(scope, cards):
     if not scope_runs:
         return set(), set(), set()
     ids, terms, phrases = set(), set(), set()
+    matches = []
     for card in cards:
         heading_runs = list(dict.fromkeys(_heading_cjk_runs(card)))
         best = ''
@@ -1348,10 +1355,36 @@ def _cjk_heading_matches(scope, cards):
                 common = _longest_common_substring(run, heading_run)
                 if len(common) > len(best):
                     best = common
-        if len(best) >= MIN_SUBJECT_PHRASE and _frame_residual(best):
-            ids.add(card.get('id'))
-            phrases.add(best)
-            terms |= {best[i:i + 2] for i in range(len(best) - 1)}
+        # A common suffix followed by a generic frame is not a subject:
+        # "三季报数据" and "年报数据" share "报数据", but after stripping
+        # the frame only the one-character suffix "报" remains. Require a
+        # meaningful noun remainder rather than promoting that fragment.
+        if len(best) >= MIN_SUBJECT_PHRASE and len(_frame_residual(best)) >= 2:
+            # Trim trailing request/frame words only. Removing frame characters
+            # inside a matched name would erase qualifiers ("一季报" -> "季报")
+            # or turn "数据中心" into a different subject.
+            subject = best
+            while True:
+                suffix = next((word for word in _FRAME_PHRASES_BY_LEN
+                               if len(word) >= 2 and subject.endswith(word)), None)
+                if suffix is None:
+                    break
+                subject = subject[:-len(suffix)]
+            if len(subject) < 2:
+                continue
+            matches.append((card.get('id'), subject))
+    for cid, subject in matches:
+        # A suffix of an explicitly more specific noun is not a second topic.
+        # Retain it if the query also names it independently (comparisons).
+        longer = {other for _, other in matches if subject != other and subject in other}
+        residual_scope = scope
+        for other in sorted(longer, key=len, reverse=True):
+            residual_scope = residual_scope.replace(other, ' ')
+        if longer and subject not in residual_scope:
+            continue
+        ids.add(cid)
+        phrases.add(subject)
+        terms |= {subject[i:i + 2] for i in range(len(subject) - 1)}
     return ids, terms, phrases
 
 
@@ -1483,7 +1516,38 @@ def _has_distinctive_unknown_subject(query, cards):
     return False
 
 
-def select_consumer_topic(all_cards, query, project, prior_provider=None):
+def _select_explicit_subject(all_cards, query, direct):
+    """Share concrete-subject admission between current and prior turns.
+
+    None means no concrete subject; [] means an explicit unknown. Whole CJK
+    phrases constrain body-only supplements on both selection paths.
+    """
+    subject_terms, subject_cards, unknown_blank = resolve_query_subject(query, all_cards)
+    if subject_cards:
+        return _same_subject_expansion(direct, subject_cards, subject_terms)
+    cjk_terms, cjk_cards, cjk_phrases = concrete_cjk_subject(
+        query, all_cards, lead_only=bool(unknown_blank))
+    if cjk_cards and not (unknown_blank
+                          and _has_distinctive_unknown_subject(query, all_cards)):
+        return _same_subject_expansion(direct, cjk_cards, cjk_terms,
+                                       subject_phrases=cjk_phrases)
+    if unknown_blank:
+        return []
+    # A complete short title/key is an explicit name too (e.g. 封签).
+    # Preserve it without promoting an incidental two-character overlap in a
+    # longer conversational frame into a subject.
+    identity = normalise_query(query)
+    exact = [card for card in all_cards if identity and any(
+        identity == normalise_query(str(card.get(field) or ''))
+        for field in ('title', 'key'))]
+    if exact and specific_terms(query):
+        return _same_subject_expansion(direct, exact, specific_terms(query),
+                                       subject_phrases={identity})
+    return None
+
+
+def select_consumer_topic(all_cards, query, project, prior_provider=None,
+                          on_recovered=None):
     """Choose the cards one consumer turn should inject (deterministic).
 
     ``all_cards`` is the authorized candidate set (own project plus read-only
@@ -1532,33 +1596,14 @@ def select_consumer_topic(all_cards, query, project, prior_provider=None):
     is_own = lambda card: card.get('project') == project
     direct = rank_consumer(all_cards, q, spec, is_own)
 
-    subject_terms, subject_cards, unknown_blank = resolve_query_subject(q, all_cards)
-    if subject_cards:
-        # A concrete current subject always wins, even over a referral carry.
-        return _same_subject_expansion(direct, subject_cards, subject_terms)
-    cjk_terms, cjk_cards, cjk_phrases = concrete_cjk_subject(
-        q, all_cards, lead_only=bool(unknown_blank))
-    if cjk_cards and not (unknown_blank
-                          and _has_distinctive_unknown_subject(q, all_cards)):
-        # A concrete CJK subject named without ``的`` (``那个仓储封签规程呢`` /
-        # ``我们接着核对青沙馆布展``) beats a referral carry; whole-phrase
-        # expansion keeps same-subject body background and drops generic noise.
-        # It is checked *before* the unknown-identifier blank so an ordinary
-        # ASCII instruction word (``policy``) cannot discard a known concrete
-        # CJK card; an explicit *distinctive* unknown (``ZorBlax``) still
-        # blanks. A turn with *only* unknown subjects still blanks below, and
-        # with an explicit unknown subject only the leading (pre-``的``)
-        # structure may supply the CJK subject: a generic suffix after the
-        # unknown name (``drifthollow 的升级方案``) is never promoted.
-        return _same_subject_expansion(direct, cjk_cards, cjk_terms,
-                                       subject_phrases=cjk_phrases)
-    if unknown_blank:
-        # An explicit but uncorroborated subject never falls back.
-        return []
+    explicit = _select_explicit_subject(all_cards, q, direct)
+    if explicit is not None:
+        return explicit
 
     followup = is_continuation(q) or is_referential_followup(q)
     if followup and prior_provider is not None:
-        recovered = recover_subject_cards(all_cards, prior_provider() or [], is_own)
+        recovered = recover_subject_cards(all_cards, prior_provider() or [], is_own,
+                                          on_recovered=on_recovered)
         if recovered:
             return recovered
 

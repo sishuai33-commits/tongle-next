@@ -1,6 +1,6 @@
 [project]
 name = "tongle-next"
-version = "0.2.0rc1"
+version = "0.4.1"
 description = "Local evidence-linked conversation memory and knowledge"
 requires-python = ">=3.11"
 dependencies = []

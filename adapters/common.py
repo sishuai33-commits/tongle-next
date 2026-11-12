@@ -26,6 +26,7 @@ support.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -102,6 +103,57 @@ def _read_json_file_bounded(path, max_bytes):
         raise AdapterError("invalid JSON in %s: %s" % (path, exc))
 
 
+def _instance_state(home):
+    if not home or not _is_abs(home):return None
+    path=os.path.join(home,'instance.json')
+    if not os.path.lexists(path):return None  # legacy instances remain supported
+    if os.path.islink(path):raise AdapterError('instance metadata cannot be a symlink')
+    try:state=_read_json_file_bounded(path,MAX_CONFIG_BYTES)
+    except OSError as exc:raise AdapterError('instance metadata unavailable') from exc
+    if not isinstance(state,dict) or state.get('owner')!='tongle-next':
+        raise AdapterError('foreign instance metadata; adapter disabled')
+    if type(state.get('enabled')) is not bool:raise AdapterError('invalid instance enabled state')
+    return state
+
+
+def instance_enabled(home):
+    """No managed metadata preserves legacy behavior; invalid ownership fails closed."""
+    state=_instance_state(home)
+    return state is None or state['enabled']
+
+
+def managed_binding(home):
+    state=_instance_state(home)
+    if state is None:return None
+    if not state['enabled']:return {'enabled':False}
+    path=os.path.join(home,'launcher.json')
+    if os.path.islink(path):raise AdapterError('runtime binding cannot be a symlink')
+    try:binding=_read_json_file_bounded(path,MAX_CONFIG_BYTES)
+    except OSError as exc:raise AdapterError('managed runtime binding unavailable') from exc
+    if not isinstance(binding,dict) or not all(_is_abs(binding.get(key)) for key in ('root','python')):
+        raise AdapterError('invalid managed runtime binding')
+    entrypoint=None
+    expected=state.get('owned_files',{}).get('bin/tongle-entry.py')
+    if expected:
+        entry=os.path.join(home,'bin','tongle-entry.py')
+        if os.path.islink(entry):raise AdapterError('managed entry cannot be a symlink')
+        try:
+            with open(entry,'rb') as source:raw=source.read(MAX_CONFIG_BYTES+1)
+        except OSError as exc:raise AdapterError('managed entry unavailable') from exc
+        if len(raw)>MAX_CONFIG_BYTES or hashlib.sha256(raw).hexdigest()!=expected:
+            raise AdapterError('managed entry changed; reconcile before using installed router')
+        entrypoint=entry
+    return dict(binding,enabled=True,bootstrap_python=state.get('bootstrap_python'),entrypoint=entrypoint)
+
+
+def refresh_binding(cfg):
+    binding=managed_binding(cfg.home)
+    if binding is None:return True
+    if not binding['enabled']:return False
+    cfg.python=binding['python'];cfg.root=binding['root']
+    return True
+
+
 def load_project_config(cwd):
     """Optional per-cwd project config. Returns dict or None."""
     if not cwd or not isinstance(cwd, str) or not os.path.isabs(cwd):
@@ -131,11 +183,14 @@ def load_config(cwd, env=None):
     if not _is_abs(home):
         raise AdapterError("%s must be an absolute path" % ENV_HOME)
     home = os.path.normpath(home)
+    binding=managed_binding(home)
 
     project = env.get(ENV_PROJECT)
     proj_cfg = load_project_config(cwd)
     if not project and proj_cfg:
         project = proj_cfg.get("project")
+    if not project:
+        project = env.get("TONGLE_NEXT_DEFAULT_PROJECT") or (binding or {}).get('project')
     if not project or not isinstance(project, str):
         raise AdapterError(
             "project is unknown: set %s or add {\"project\": ...} to %s"
@@ -154,6 +209,8 @@ def load_config(cwd, env=None):
     cli_override = env.get(ENV_CLI)  # unit tests only
     python = env.get(ENV_PYTHON)
     root = env.get(ENV_ROOT)
+    if binding and binding['enabled']:
+        python=binding['python'];root=binding['root']
     if cli_override:
         if not _is_abs(cli_override):
             raise AdapterError("%s must be an absolute path" % ENV_CLI)
@@ -180,6 +237,11 @@ def run_cli(cfg, args, stdin_text=None, timeout=CAPTURE_TIMEOUT_SEC):
     Returns dict(ok, rc, stdout, stderr, error). Never raises for core
     failures; ok=False with a truthful error string instead.
     """
+    try:
+        if not refresh_binding(cfg):
+            return {"ok":False,"rc":None,"stdout":"","stderr":"","error":"tongle instance is disabled; nothing executed","disabled":True}
+    except AdapterError as exc:
+        return {"ok":False,"rc":None,"stdout":"","stderr":"","error":str(exc)}
     argv = cfg.base_argv() + list(args)
     env = dict(os.environ)
     if cfg.root and not cfg.cli_override:
@@ -242,7 +304,8 @@ def _valid_capture_ack(stdout):
     return False
 
 
-def capture_event(cfg, session_id, role, event_id, text, receipt_id=None):
+def capture_event(cfg, session_id, role, event_id, text, receipt_id=None, memory_receipt_id=None,
+                  reply_to_event_id=None):
     """Persist one exact event. Returns (ok, warning_or_None).
 
     Oversized events are rejected with an explicit NOT-saved warning rather
@@ -260,7 +323,9 @@ def capture_event(cfg, session_id, role, event_id, text, receipt_id=None):
         cfg,
         ["capture", "--project", cfg.project, "--session", session_id,
          "--role", role, "--event-id", event_id] +
-        (["--receipt-id", receipt_id] if receipt_id is not None else []),
+        (["--receipt-id", receipt_id] if receipt_id is not None else []) +
+        (["--memory-receipt-id", memory_receipt_id] if memory_receipt_id else []) +
+        (["--reply-to-event-id", reply_to_event_id] if reply_to_event_id else []),
         stdin_text=text,
         timeout=CAPTURE_TIMEOUT_SEC,
     )
@@ -268,10 +333,18 @@ def capture_event(cfg, session_id, role, event_id, text, receipt_id=None):
         return False, result["error"]
     if not _valid_capture_ack(result["stdout"]):
         return False, "core returned no valid capture ack; event NOT saved"
+    if memory_receipt_id:
+        try:
+            ack = json.loads(result['stdout'])
+        except (TypeError, ValueError):
+            ack = {}
+        binding_error = ack.get('memory_receipt_binding_error') if isinstance(ack, dict) else None
+        if isinstance(binding_error, str) and binding_error:
+            return True, 'assistant saved; memory receipt NOT bound (%s)' % binding_error
     return True, None
 
 
-def fetch_context(cfg, text, limit=QUERY_RECORD_LIMIT, session_id="", receipt=None):
+def fetch_context(cfg, text, limit=QUERY_RECORD_LIMIT, session_id="", receipt=None, budget=None, current_source_id=None):
     """Fetch project context for injection. Returns (context_or_None, warning).
 
     Uses the core `context` command (records + recent raw user statements).
@@ -283,11 +356,24 @@ def fetch_context(cfg, text, limit=QUERY_RECORD_LIMIT, session_id="", receipt=No
     and no receipt. An older core without ``rendered_context`` goes through the
     legacy renderer, which may truncate and therefore never claims a receipt.
     """
+    if len(text or "") > MAX_EVENT_TEXT_CHARS:
+        return None, 'context text exceeds %d char adapter bound; nothing injected' % MAX_EVENT_TEXT_CHARS
     query_text = (text or "").strip() or "current project status, decisions, corrections"
-    args = ["--project", cfg.project, "--text", query_text[:4000], "--limit", str(limit)]
-    result = run_cli(cfg, ["context"] + args + (["--session", session_id] if session_id else []), timeout=QUERY_TIMEOUT_SEC)
+    # Long turns must keep trailing restrictions without risking argv limits.
+    # The core owns its bounded retrieval projection, not this transport layer.
+    use_stdin = len(query_text) > 4000
+    text_args = ["--text-stdin"] if use_stdin else ["--text", query_text]
+    args = ["--project", cfg.project] + text_args + ["--limit", str(limit)]
+    maximum = QUERY_CONTEXT_BUDGET_CHARS if budget is None else budget
+    if type(maximum) is not int or not 1 <= maximum <= QUERY_CONTEXT_BUDGET_CHARS:
+        return None, 'invalid context budget'
+    context_args = (["--budget", str(maximum)] if budget is not None else [])
+    if current_source_id:
+        context_args += ["--current-source-id", current_source_id]
+    result = run_cli(cfg, ["context"] + args + (["--session", session_id] if session_id else []) + context_args,
+                     stdin_text=query_text if use_stdin else None, timeout=QUERY_TIMEOUT_SEC)
     used = "context"
-    if not result["ok"] and result["error"] and (
+    if not use_stdin and not result["ok"] and result["error"] and (
             "unknown command" in result["error"].lower()
             or "no such command" in result["error"].lower()
             or "unrecognized" in result["error"].lower()):
@@ -295,30 +381,33 @@ def fetch_context(cfg, text, limit=QUERY_RECORD_LIMIT, session_id="", receipt=No
         used = "query"
     if not result["ok"]:
         return None, result["error"]
-    rendered, canonical, err, rid = _extract_core_context(result["stdout"])
+    rendered, canonical, err, rid, memory_rid, memory_warning = _extract_core_context(result["stdout"])
     if err:
         return None, "invalid %s JSON from core; nothing injected (%s)" % (used, err)
-    if rendered is None or not rendered.strip():
-        return None, None  # no records: inject nothing; that is a truthful answer
     if canonical:
         # The core already built the whole payload within the budget. A
         # canonical payload that still exceeds the bound is treated as
         # malformed: fail closed, inject nothing, bind no receipt.
-        if _utf16_length(rendered) > QUERY_CONTEXT_BUDGET_CHARS:
+        if _utf16_length(rendered) > maximum:
             return None, ("core context payload exceeds the %d-char budget; "
-                          "nothing injected (fail closed)" % QUERY_CONTEXT_BUDGET_CHARS)
-        wrapped = rendered
-        if receipt is not None and isinstance(rid, str) and rid:
-            receipt["id"] = rid
-        return wrapped, None
+                          "nothing injected (fail closed)" % maximum)
+        if receipt is not None:
+            if isinstance(rid, str) and rid:
+                receipt["id"] = rid
+            if isinstance(memory_rid, str) and memory_rid:
+                receipt["memory_id"] = memory_rid
+        # Empty contexts still carry their prepared receipt for Stop binding.
+        return (rendered if rendered.strip() else None), memory_warning
+    if rendered is None or not rendered.strip():
+        return None, None  # no records: inject nothing; that is a truthful answer
     # Legacy fallback (older core): render locally. It may truncate, so it can
     # never be presented as a complete delivery and never binds a receipt. The
     # budget is measured and cropped on the UTF-16 code-unit boundary (an
     # astral character is two units), never on Python code points, so an astral
     # payload can no longer overflow the fixed 6000-unit bound.
     wrapped = wrap_context(rendered)
-    if _utf16_length(wrapped) > QUERY_CONTEXT_BUDGET_CHARS:
-        wrapped = _utf16_truncate(wrapped, QUERY_CONTEXT_BUDGET_CHARS,
+    if _utf16_length(wrapped) > maximum:
+        wrapped = _utf16_truncate(wrapped, maximum,
                                   TRUNCATION_MARKER)
     return wrapped, None
 
@@ -354,7 +443,7 @@ def _utf16_truncate(text, max_units, marker):
 
 
 def _extract_core_context(stdout):
-    """Return ``(rendered_or_None, canonical, error_or_None, receipt_id)``.
+    """Return rendered/canonical/error plus evolving and memory receipt data.
 
     ``canonical`` is True only when the core supplied a whole-block
     ``rendered_context`` string, which the adapter must use verbatim.
@@ -362,15 +451,17 @@ def _extract_core_context(stdout):
     try:
         data = json.loads(stdout)
     except (ValueError, TypeError) as exc:
-        return None, False, str(exc), None
+        return None, False, str(exc), None, None, None
     if not isinstance(data, dict):
-        return None, False, "top-level JSON is not an object", None
+        return None, False, "top-level JSON is not an object", None, None, None
     rid = data.get("receipt_id") if isinstance(data.get("receipt_id"), str) else None
+    memory_rid = data.get("memory_receipt_id") if isinstance(data.get("memory_receipt_id"), str) else None
+    memory_warning = data.get("memory_receipt_warning") if isinstance(data.get("memory_receipt_warning"), str) else None
     rc = data.get("rendered_context")
     if isinstance(rc, str):
-        return rc, True, None, rid
+        return rc, True, None, rid, memory_rid, memory_warning
     rendered, err = render_context_result(stdout)
-    return rendered, False, (err or None), rid
+    return rendered, False, (err or None), rid, memory_rid, memory_warning
 
 
 # Backwards-compatible alias (older call sites/tests).

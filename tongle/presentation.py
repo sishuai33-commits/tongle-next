@@ -1,20 +1,10 @@
 """Readable Markdown presentation; identity remains stable in the database."""
 import json,re
 
-_WINDOWS_RESERVED={'CON','PRN','AUX','NUL'}|{'COM'+n for n in '123456789¹²³'}|{'LPT'+n for n in '123456789¹²³'}
-
-def windows_reserved_name(name):
-    if not isinstance(name,str):return False
-    stem=name.split('.',1)[0].rstrip(' .').upper()
-    return stem in _WINDOWS_RESERVED
-
 def label(text,fallback='未命名记录',limit=36):
     value=re.sub(r'[\x00-\x1f<>:"/\\|?*#\[\]`%]',' ',str(text))
     value=re.sub(r'\s+',' ',value).strip(' .')[:limit].strip(' .')
-    value=value or fallback
-    if windows_reserved_name(value):
-        value='_'+value
-    return value
+    return value or fallback
 
 def folder(value):
     if not isinstance(value,str) or not value or value in ('.','..') or '/' in value or '\\' in value or value.startswith('.') or len(value)>80:

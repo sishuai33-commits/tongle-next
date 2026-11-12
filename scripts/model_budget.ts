@@ -55,6 +55,16 @@ export default function(pi: any) {
   }
   const maxRequests = parsedMax;
   let requests = 0;
+  // Keep the real empty TemporaryDirectory isolation in pi_model.py, but do
+  // not leak its random path into the provider's early cache prefix. This
+  // extension is loaded only by Tongle's no-tools worker, never globally.
+  // Older Pi versions without structured prompt sections remain unchanged.
+  pi.on("before_agent_start", (event: any) => {
+    if (event.systemPromptOptions?.sections) {
+      event.systemPromptOptions.sections.cwd =
+        "Isolated temporary worker; filesystem tools are disabled.";
+    }
+  });
   pi.on("before_provider_request", (event: any) => {
     requests += 1;
     if (requests > maxRequests) {

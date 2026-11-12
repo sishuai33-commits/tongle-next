@@ -470,7 +470,8 @@ def build_receipt(evo, work_id, bundle, plan, approval, changed_ids, applied_ver
         raise ValueError('protocol mismatch')
     if not isinstance(bundle, dict) or bundle.get('protocol') != PROTOCOL:
         raise ValueError('bundle malformed')
-    from . import delta_contract
+    from .delta_versions import contract_for
+    delta_contract = contract_for(bundle=bundle)
     context = delta_contract.revalidate_context(bundle.get('context'))
     binding = bundle.get('binding')
     if binding != _hash({'scope': bundle.get('scope'), 'binding': context.get('binding')}):
@@ -494,12 +495,15 @@ def build_receipt(evo, work_id, bundle, plan, approval, changed_ids, applied_ver
     # ledger/audit proofs of the revision-0 history steps. The source/semantic
     # repair replay was already proven by the executor before finalize; the
     # receipt keeps only identity digests, never the draft/error/model prose.
+    from . import delta_stage_policy as policy
+    stage_local = policy.require_identity(evo, work_id, bundle)
+    policy_fields = policy.receipt_fields(evo, work_id, bundle) if stage_local else None
     revision = bundle.get('revision', 0)
-    if revision not in (0, 1):
+    if not stage_local and revision not in (0, 1):
         raise ValueError('revision malformed')
     repair = None
     history_stages = []
-    if revision == 1:
+    if not stage_local and revision == 1:
         feedback = bundle.get('repair_feedback')
         if not isinstance(feedback, dict) or feedback.get('kind') not in (
                 'plan', 'unresolved', 'review'):
@@ -538,8 +542,8 @@ def build_receipt(evo, work_id, bundle, plan, approval, changed_ids, applied_ver
         applied_cards.append(_card_proof(hist['id'], hist['version'], hist['body'],
                                          hist['title'], hist['topic'], hist['state'],
                                          hist['evidence']))
-    return {
-        'schema': RECEIPT_SCHEMA,
+    receipt = {
+        'schema': policy.RECEIPT_SCHEMA if stage_local else RECEIPT_SCHEMA,
         'protocol': PROTOCOL,
         'work_id': work_id,
         'project': _get(row, 'project'),
@@ -566,6 +570,10 @@ def build_receipt(evo, work_id, bundle, plan, approval, changed_ids, applied_ver
         'repair': repair,
         'history_stages': history_stages,
     }
+    if stage_local:
+        receipt.update(policy_fields)
+        policy.verify_receipt(evo, work_id, receipt)
+    return receipt
 
 
 # ------------------------------------------------------------------[ verify
@@ -796,7 +804,7 @@ def _completion_audit(evo, work_id):
         obj = json.loads(rows[0]['error'])
     except (ValueError, TypeError):
         raise ValueError('completion audit malformed')
-    if not isinstance(obj, dict) or obj.get('schema') != RECEIPT_SCHEMA:
+    if not isinstance(obj, dict) or obj.get('schema') not in (RECEIPT_SCHEMA, 3):
         raise ValueError('completion audit schema mismatch')
     return obj
 
@@ -822,14 +830,23 @@ def _verify_receipt(evo, row, receipt):
     kind = receipt.get('kind')
     if kind not in ('applied', 'no_op') or (kind == 'applied') != bool(changed):
         raise ValueError('receipt kind invalid')
+    from . import delta_stage_policy as policy
+    stage_local = receipt.get('schema') == policy.RECEIPT_SCHEMA
+    if stage_local:
+        policy.verify_receipt(evo, work_id, receipt)
+    elif 'execution_policy' in receipt or evo.db.execute(
+            'SELECT 1 FROM knowledge_failures WHERE work_id=? AND state=?',
+            (work_id, policy.AUDIT)).fetchone():
+        raise ValueError('legacy receipt has execution policy')
     revision = receipt.get('revision', 0)
-    if revision not in (0, 1):
+    if not stage_local and revision not in (0, 1):
         raise ValueError('receipt revision malformed')
     _verify_batch(evo, work_id, project, receipt.get('op_hash'),
                   receipt.get('review_hash'), changed)
     _verify_stages(evo, work_id, receipt.get('stages'), receipt.get('binding'))
-    _verify_history_stages(evo, work_id, revision, receipt.get('repair'),
-                           receipt.get('history_stages'), receipt.get('binding'))
+    if not stage_local:
+        _verify_history_stages(evo, work_id, revision, receipt.get('repair'),
+                               receipt.get('history_stages'), receipt.get('binding'))
     required = receipt.get('owned_refs')
     if not isinstance(required, list) or len(set(required)) != len(required):
         raise ValueError('owned coverage malformed')
@@ -875,6 +892,9 @@ def verify_completed(evo, work_id):
     row = _row(evo, work_id)
     if row is None:
         raise ValueError('work missing')
+    from . import dependency_maintenance
+    if dependency_maintenance.has_completion(evo, work_id):
+        return dependency_maintenance.verify_completed(evo, work_id)
     if _get(row, 'pipeline_protocol') != PROTOCOL:
         raise ValueError('protocol mismatch')
     if _get(row, 'state') != 'done':

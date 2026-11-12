@@ -5,7 +5,7 @@ from .presentation import folder
 
 def search(home,text,limit=3,project=None):
     path=Path(home)/'config.json'
-    try:cfg=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    try:cfg=json.loads(path.read_text()) if path.exists() else {}
     except (OSError,ValueError):return []
     if project in cfg.get('library_excluded_projects',[]):return []
     if not cfg.get('library_vault') or not text.strip():return []
@@ -17,7 +17,7 @@ def search(home,text,limit=3,project=None):
         if p.is_symlink() or not p.resolve().is_relative_to(root) or any(part.startswith('.') or part=='_archived' for part in p.relative_to(root).parts):continue
         try:
             if p.stat().st_size>1024*1024:continue
-            body=p.read_text(encoding='utf-8',errors='replace')
+            body=p.read_text(errors='replace')
         except OSError:continue
         lower=body.lower()
         hits=[term for term in terms if term in lower]

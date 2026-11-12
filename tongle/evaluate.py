@@ -345,7 +345,7 @@ def prepare(root, case, candidate=False):
         for source in case['sources']:
             if source['role'] == 'document':
                 folder = root/'excerpts'; folder.mkdir(exist_ok=True)
-                path = folder/(digest(source['key'])+'.md'); path.write_text(source['text'],encoding='utf-8')
+                path = folder/(digest(source['key'])+'.md'); path.write_text(source['text'])
                 receipt = engine.store.ingest(case['project'], str(path))
                 evolution.captured(receipt['source_id'], 'document', 'fixture')
             else:
@@ -470,14 +470,10 @@ def consume(root, case, task, arm, pi, provider, model, timeout):
         cmd += ['-e', str(repo / 'adapters/pi.ts')]
     cmd += ['-p', task['prompt']]
     start = time.monotonic()
-    from .portability import process_options
-    env['PYTHONUTF8'] = '1'
-    env['PYTHONIOENCODING'] = 'utf-8'
     with (root / 'events.jsonl').open('x', encoding='utf-8') as out, \
             (root / 'stderr.txt').open('x', encoding='utf-8') as err:
         child = subprocess.Popen(cmd, cwd=workspace, env=env, stdout=out, stderr=err,
-                                 text=True, encoding='utf-8',
-                                 **process_options(detached=True))
+                                 text=True, start_new_session=True)
         try:
             returncode = child.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -499,20 +495,20 @@ def consume(root, case, task, arm, pi, provider, model, timeout):
 
 
 def _terminate(child):
-    """Kill the owned process group; escalate to SIGKILL after a grace period.
-
-    Delegates to the shared portability helper so the pgid is the child's own
-    pid/session (never a stale or inherited caller group) and only
-    ProcessLookupError is swallowed.
-    """
-    from .portability import terminate_tree
-    terminate_tree(child)
+    """Kill the process group; escalate to SIGKILL after a grace period."""
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
     try:
         child.wait(timeout=3)
         return
     except subprocess.TimeoutExpired:
         pass
-    terminate_tree(child, force=True)
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
     child.wait()
 
 

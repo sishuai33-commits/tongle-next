@@ -8,9 +8,9 @@ from pathlib import Path
 import re
 import tempfile
 import time
+from .portability import fsync_directory, lock_file
 from .store import Store
 from .presentation import label,folder,title,hidden_metadata
-from .portability import lock_file, unlock_file, fsync_directory
 
 BEGIN='%% tongle:body %%\n'
 END='\n%% /tongle:body %%'
@@ -54,12 +54,13 @@ class Engine:
             lock_file(f)
             self._lock_depth=1
             try:yield
-            finally:
-                self._lock_depth=0
+            finally:self._lock_depth=0
     def __init__(self,home):
         self.home=Path(home).resolve()
         self.store=Store(self.home)
         self.db=self.store.db
+        from .memory_runtime import register
+        register(self)
         with self.locked():
             cols={r[1] for r in self.db.execute('PRAGMA table_info(records)')}
             if 'note_title' not in cols:
@@ -125,6 +126,8 @@ class Engine:
             if not prior or prior['state']!=state:
                 self.db.execute('INSERT OR REPLACE INTO source_status(source_id,state,updated_at) VALUES(?,?,?)',(sid,state,time.time()))
             for job in self.db.execute("SELECT * FROM jobs WHERE state IN ('blocked','pending','retry')").fetchall():
+                from .memory_runtime import source_allowed
+                if not source_allowed(self,job['source_id'],job['version']):continue
                 if sid not in self.job_source_ids(job):continue
                 if state=='revoked':
                     self.db.execute("UPDATE jobs SET state='obsolete',lease_until=0 WHERE id=?",(job['id'],))
@@ -337,9 +340,11 @@ class Engine:
         return {'results':results,'adoption':'unknown','offered':len(results)}
 
     @synchronized
-    def context(self,project,text,limit=8,session=''):
+    def context(self,project,text,limit=8,session='',budget=6000,current_source_id=None):
+        if type(budget) is not int or not 1 <= budget <= 6000:
+            raise ValueError('context budget must be between 1 and 6000 UTF-16 units')
         from .evolution import enabled,Evolution
-        if enabled(self):return Evolution(self).context(project,text,limit,session)
+        if enabled(self):return Evolution(self).context(project,text,limit,session,budget=budget,current_source_id=current_source_id)
         result=self.query(project,text,limit)
         from .library import search
         library=search(self.home,text,project=project)

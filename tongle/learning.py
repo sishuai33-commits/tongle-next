@@ -119,6 +119,8 @@ class Learning:
         return snap
 
     def _register(self, project, receipt, outcome=None, feedback=None):
+        from .memory_runtime import allowed
+        if not allowed(self.engine,project): return {'disabled':True,'reason':'memory_only'}
         rid = digest([project, receipt])[:32]
         with self.engine.locked(), self.engine.transaction():
             row = self.db.execute('SELECT * FROM knowledge_learning WHERE id=?', (rid,)).fetchone()
@@ -150,6 +152,8 @@ class Learning:
             return self.get(rid)
 
     def observe(self, project, receipt_id, outcome_source_id):
+        from .memory_runtime import allowed
+        if not allowed(self.engine,project): return {'disabled':True,'reason':'memory_only'}
         with self.engine.locked(), self.engine.transaction():
             outcome = self._source(outcome_source_id, project)
             # Validate on every entry, including duplicate registrations.
@@ -162,6 +166,8 @@ class Learning:
     def ingest(self, projects):
         if not isinstance(projects, list) or not all(isinstance(p, str) and p for p in projects):
             raise ValueError('explicit project list required')
+        from .memory_runtime import allowed
+        projects = [p for p in projects if allowed(self.engine,p)]
         result = []
         with self.engine.locked(), self.engine.transaction():
             for row in self.db.execute("SELECT * FROM knowledge_feedback WHERE state='candidate' ORDER BY receipt_id").fetchall():
@@ -554,6 +560,9 @@ class Learning:
         current = config(self.engine)
         if current.get('knowledge_learning_projects') != projects or identity(current) != identity(cfg):
             return {'calls': 0, 'disabled': True, 'reason': 'configuration changed'}
+        from .memory_runtime import allowed
+        projects=[p for p in projects if allowed(self.engine,p)]
+        if not projects:return {'calls':0,'disabled':True,'reason':'memory_only'}
         with self.engine.locked():
             KnowledgeFiles(self.engine).sync()
         self._monitor(projects)

@@ -17,7 +17,7 @@ import hashlib
 import json
 import re
 
-from tongle import card_delta, source_windows
+from tongle import card_delta, delta_layout, source_windows
 
 PROTOCOL = 'tongle-delta-contract-v1'
 
@@ -90,6 +90,11 @@ SEMANTIC_POLICY = (
     '同一组参数或规则只改部分字段时，若更新后的目标仍完整保留其余字段，请把整组 owned 片段连到同一个 update 的 source_refs 和 material disposition；这表示完整事实组由更新结果承接，不要求为未变字段另造编辑。'
     'covered 只能引用 active 卡片中本轮未被改写、且其原文片段仍完整保留在实际生成正文中的片段：同一张卡的其他片段在本轮被更新，不影响其未被改写的片段作为覆盖；被 replace 指向的片段绝不构成 covered（即使其中部分字词仍在生成正文中，或别处存在相同段落）；被 retire 的卡绝不构成 covered。'
     '内部短别名只用于结构字段，禁止把它们写进给用户看的标题或正文；原文真实业务编号可保留。'
+    '新证据取代旧的当前解释时，必须同时更正相应的标题或当前段落，使最终正文整体一致；'
+    '历史内容可保留但须明确区分，不得只在末尾追加正确内容而让“尚未”与“已经”并列为当前状态。'
+    '新的捕获时点不代表来源所述状态已经更新；reference 只解释 owned。'
+    '助手旧报告或旧授权不能压过卡片已有的更晚实施状态或人工条件；'
+    '无法判断时忠实保留出处与不确定性，不按日期机械裁决。'
 )
 
 
@@ -292,6 +297,7 @@ def build_context(window, cards):
         raise ValueError('too many cards')
     card_ids = []
     evidence_by_index = []
+    unavailable_by_index = []
     body_cards = []
     for card in cards:
         if not isinstance(card, dict):
@@ -300,10 +306,17 @@ def build_context(window, cards):
         evidence = card.get('evidence')
         if not isinstance(evidence, list):
             raise ValueError('card evidence missing')
+        unavailable = card.get('unavailable_evidence')
+        if unavailable is None:
+            unavailable = []
+        if not isinstance(unavailable, list):
+            raise ValueError('card unavailable_evidence must be a list')
         card_ids.append(card.get('id'))
         evidence_by_index.append(_deep(evidence))
+        unavailable_by_index.append(_deep(unavailable))
         payload = _deep(card)
         payload.pop('evidence', None)
+        payload.pop('unavailable_evidence', None)
         body_cards.append(payload)
     if len(set(card_ids)) != len(card_ids):
         raise ValueError('card ids not unique')
@@ -314,11 +327,19 @@ def build_context(window, cards):
     other = {
         'protocol': PROTOCOL,
         'window': refrozen,
-        'cards': [{'snapshot': snap, 'evidence': evidence_by_index[i]} for i, snap in enumerate(card_snapshots)],
+        'cards': [_context_card_entry(snap, evidence_by_index[i], unavailable_by_index[i])
+                  for i, snap in enumerate(card_snapshots)],
     }
     binding = _hash(other)
     context = {'protocol': PROTOCOL, 'window': refrozen, 'cards': other['cards'], 'binding': binding}
     return _deep(context)
+
+
+def _context_card_entry(snapshot, evidence, unavailable=None):
+    entry = {'snapshot': snapshot, 'evidence': evidence}
+    if unavailable:
+        entry['unavailable_evidence'] = unavailable
+    return entry
 
 
 def revalidate_context(context):
@@ -329,11 +350,15 @@ def revalidate_context(context):
     if not isinstance(cards, list):
         raise ValueError('context cards must be a list')
     for entry in cards:
-        _exact_keys(entry, ('snapshot', 'evidence'), 'context card')
+        keys = set(entry.keys())
+        if not {'snapshot', 'evidence'} <= keys or not keys <= {'snapshot', 'evidence', 'unavailable_evidence'}:
+            raise ValueError('context card has wrong fields')
         if not isinstance(entry.get('snapshot'), dict):
             raise ValueError('context card snapshot must be an object')
         if not isinstance(entry.get('evidence'), list):
             raise ValueError('context card evidence must be a list')
+        if not isinstance(entry.get('unavailable_evidence', []), list):
+            raise ValueError('context card unavailable_evidence must be a list')
     other = {'protocol': context.get('protocol'), 'window': context.get('window'), 'cards': cards}
     if _hash(other) != context.get('binding'):
         raise ValueError('context revalidation failed')
@@ -763,6 +788,9 @@ def plan_payload(context):
         'covered 必须由 cited active 卡片片段完整蕴含；仅主题相同或“与上下文无新意”而无 cited active 卡片不构成 covered。'
         'changes 允许 0..8 条；当 covered/nonmaterial 足以覆盖所有 owned 片段时可以为空，不得用未链接的 create 伪造 noop。'
         '每个 change 必须被至少一个 material disposition 链接。更新只能通过给出目标卡片的片段编辑实现，不得整篇重写。'
+        '每个 edit 的 text 是整段替换或整段插入，必须自带所需的块分隔（通常以空行结尾或以换行开头），'
+        '原正文末尾的单行纯文本续写可逐字接续；块结构仍须明确分隔。'
+        '不得输出与相邻已有标题同级同名的重复标题；host 会确定性拒绝丢失块分隔或新引入相邻重复标题的计划。'
         'disposition 的 source_refs 必须逐字取自 owned_source_refs 清单（该清单已列出全部合法引用），不得按来源在窗口中的位置自行推算编号。'
         'material disposition 的每个 source_ref 必须同时出现在其链接的至少一个 change 的 source_refs 中；'
         '无持久价值时 changes 必须为空数组，不要先建 change 再放弃链接。'
@@ -828,6 +856,9 @@ def review_payload(context, plan):
         '来源支持的更新若已被 update/edits 与 disposition 完整承载，则 N 为 pass；已保留的既有限定词不否定新颖性。'
         'known conflict 可作为已记录事实存在，复核者不需要、也不得替用户裁决业务分歧。'
         '必须复核所有实际 create body 与 update edits、每条 disposition、整个窗口。'
+        'final_cards 是 host 根据本计划 operations 重新编译得到的最终变更卡正文，不是模型自报结果；'
+        '必须复核其标题、摘要与当前状态和正文整体一致、时序与归属正确、人工补充与既有格式未被破坏；'
+        '发现冲突按 fail/unknown 处理。'
         'covered 必须完整蕴含被主张的全部增量，且必须引用 cited active 卡片中本轮未被改写、原文片段仍保留在生成正文中的片段；被 replace 的片段或被 retire 的卡不构成 covered；仅主题相同，或仅“与上下文无新意”而没有 cited active 卡片，不构成 covered。'
         '决定、偏好、明确纠正、重要发现、授权或已被接受的下一步默认 material，除非被具体覆盖；'
         '无持久含义的问候、冗余传输或状态可 nonmaterial。'
@@ -841,20 +872,95 @@ def review_payload(context, plan):
         'dispositions': _deep(plan['dispositions']),
     }
     manual_targets = _required_manual_targets(context, plan)
+    # Host-derived final bodies of the cards this plan would change, computed
+    # by recompiling the exact bound operations above -- never model-reported.
+    # Large shared bodies are represented losslessly below; body caps alone
+    # do not bound their serialized UTF-8 byte cost.
+    alias_by_id = {}
+    for i, entry in enumerate(context['cards']):
+        alias_by_id[entry['snapshot'].get('id')] = f'c{i + 1}'
+    final_cards = []
+    for op_index, op in enumerate(recompiled['operations']):
+        change_ref = f'n{op_index + 1}'
+        if op.get('op') == 'create':
+            final_cards.append({'change': change_ref, 'action': 'create', 'target': None,
+                                'title': op.get('title'), 'topic': op.get('topic'),
+                                'body': op.get('body')})
+        elif op.get('op') == 'update':
+            alias = alias_by_id.get(op.get('id'))
+            if alias is None:
+                raise ValueError('plan update target not in context')
+            snap = context['cards'][int(alias[1:]) - 1]['snapshot']
+            final_cards.append({'change': change_ref, 'action': 'update', 'target': alias,
+                                'title': snap.get('title'), 'topic': snap.get('topic'),
+                                'body': op.get('body')})
     owned_sources, reference_context = _partition_source_payload(context['window'])
     owned_refs, reference_refs, _all_refs = _ref_partitions(context)
-    return {
+    payload = {
         'stage': 'delta_review',
         'task': task + SEMANTIC_POLICY,
         'sources': owned_sources,
         'reference_context': reference_context,
         'cards': _card_payload(context),
         'draft': draft,
+        'final_cards': final_cards,
         'owned_source_refs': owned_refs,
         'reference_source_refs': reference_refs,
         'required_human_preservation_targets': manual_targets,
         'response_schema': _review_schema(len(plan['dispositions']), manual_targets),
     }
+    return _compact_review(payload)
+
+
+def _compact_review(payload):
+    """Deduplicate repeated text losslessly, retaining full final bodies.
+
+    Only used for large payloads. Old replaced text that has no exact match
+    stays verbatim. Each reference is checked against its original text by
+    the host; Unicode offsets are half-open code-point positions, not bytes.
+    Neither source evidence nor final bodies are truncated or summarized.
+    """
+    if len(_canonical(payload).encode('utf-8')) <= 250000:
+        return payload
+    bodies = {card['change']: card['body'] for card in payload['final_cards']}
+    changed = False
+
+    def share(container, key):
+        nonlocal changed
+        text = container.get(key)
+        if not isinstance(text, str) or len(text.encode('utf-8')) < 256:
+            return
+        for ref, body in bodies.items():
+            start = body.find(text)
+            if start >= 0:
+                end = start + len(text)
+                if body[start:end] != text:
+                    raise ValueError('review shared text reconstruction mismatch')
+                container[key] = {'final_card': ref, 'start': start, 'end': end}
+                changed = True
+                return
+
+    for card in payload['cards']:
+        for segment in card['segments']:
+            share(segment, 'text')
+    drafts = [payload['draft']]
+    feedback = payload.get('repair_feedback')
+    if isinstance(feedback, dict) and isinstance(feedback.get('prior_draft'), dict):
+        drafts.append(feedback['prior_draft'])
+    for draft in drafts:
+        for change in draft.get('changes', []):
+            share(change, 'body')
+            for edit in change.get('edits', []):
+                share(edit, 'text')
+    if changed:
+        payload['text_encoding'] = (
+            '正文无损共享：text/body 为对象 {final_card,start,end} 时，原文等于 '
+            'final_cards 中 change=final_card 的完整 body[start:end]，下标按 Unicode 码点、'
+            '左闭右开。宿主已逐字核验；这不是摘要，也不自动证明人工内容已保留。'
+            '阅读全文一次，并按这些精确引用核对旧段、编辑、新正文；没有引用的旧文仍完整给出。'
+        )
+    return payload
+
 
 
 def _span_lookup(window):
@@ -893,7 +999,9 @@ def _card_by_ref(context):
         segments = []
         for seg_index, seg in enumerate(snapshot.get('segments', [])):
             segments.append((f'c{index + 1}g{seg_index + 1}', seg))
-        out[f'c{index + 1}'] = {'snapshot': snapshot, 'evidence': entry['evidence'], 'scope': scope, 'segments': segments}
+        out[f'c{index + 1}'] = {'snapshot': snapshot, 'evidence': entry['evidence'],
+                                 'unavailable_evidence': entry.get('unavailable_evidence') or [],
+                                 'scope': scope, 'segments': segments}
     return out
 
 
@@ -1021,6 +1129,9 @@ def _compile_changes(context, changes, known_spans, part_map, card_map):
             _guard_published_text(title, (source_original,), f'{where} title')
             _guard_published_text(topic, (source_original,), f'{where} topic')
             _guard_published_text(body, (source_original,), f'{where} body')
+            # A create body is wholly model-written, so any adjacent duplicate
+            # same-level heading in it is newly introduced (old count is 0).
+            delta_layout.check_heading_duplicates('', body, f'{where} body')
             key = 'delta-' + _hash([context['binding'], index])[:32]
             evidence = _dedupe_evidence(new_evidence)
             if len(evidence) > EVIDENCE_CAP:
@@ -1086,6 +1197,41 @@ def _compile_changes(context, changes, known_spans, part_map, card_map):
             planned = card_delta.apply_delta(entry['snapshot'], apply_edits)
             if not isinstance(planned, dict) or not isinstance(planned.get('body'), str):
                 raise ValueError('apply_delta result invalid')
+            # Layout guards on the REAL concatenation boundaries. ``pieces``
+            # mirrors apply_delta's verbatim join: a replaced segment's new
+            # text or an inserted text is ``is_new``; untouched original
+            # segment bytes are not re-judged. Only a junction that involves
+            # newly written text and has no line break on either side is a
+            # newly introduced block-merge (e.g. prose glued onto a following
+            # table header). The heading check compares against the pre-edit
+            # body so historical duplicates, code fences, CRLF and EOF forms
+            # are preserved, not forced clean.
+            pieces = []
+            retained_ranges = []
+            final_offset = 0
+            replace_text = {}
+            insert_texts = {}
+            for applied in apply_edits:
+                if applied['op'] == 'replace':
+                    replace_text[applied['segment_id']] = applied['text']
+                else:
+                    insert_texts.setdefault(applied['segment_id'], []).append(applied['text'])
+            for _short_ref, seg in entry['segments']:
+                seg_id = seg.get('id')
+                if seg_id in replace_text:
+                    pieces.append((replace_text[seg_id], True))
+                else:
+                    pieces.append((seg.get('text'), False))
+                    retained_ranges.append((final_offset, final_offset + len(seg['text']), seg['start']))
+                final_offset += len(pieces[-1][0])
+                for inserted in insert_texts.get(seg_id, []):
+                    pieces.append((inserted, True))
+                    final_offset += len(inserted)
+            last_segment = entry['segments'][-1][1]['id']
+            inline_eof = any(edit['op'] == 'insert_after' and edit['segment_id'] == last_segment
+                             for edit in apply_edits)
+            delta_layout.check_piece_junctions(pieces, where, allow_inline_eof=inline_eof)
+            delta_layout.check_heading_duplicates(entry['snapshot'].get('body'), planned['body'], where, retained_ranges)
             expected_version = planned['expected_version']
             # The actual compiled resulting body is the proof that an untouched
             # original segment's bytes really survive into what will be stored.
@@ -1096,6 +1242,21 @@ def _compile_changes(context, changes, known_spans, part_map, card_map):
             # is bounded by what is already persisted, while each update may add
             # at most EVIDENCE_CAP new unique full-part quotes.
             inherited = _dedupe_evidence(entry['evidence'])
+            # Evidence tuples whose source has since been revoked/marked
+            # unavailable were excluded at context build; they remain in the
+            # frozen snapshot (and in the card's stored history) but cannot
+            # ground a new operation, so they are not inherited. Without this,
+            # every future update of such a card would deadlock on a citation
+            # the model neither chose nor can change.
+            unavailable_keys = {
+                (e.get('source_id'), e.get('version'), e.get('quote'))
+                for e in (entry.get('unavailable_evidence') or [])
+                if isinstance(e, dict)
+            }
+            if unavailable_keys:
+                inherited = [e for e in inherited
+                             if (e.get('source_id'), e.get('version'), e.get('quote'))
+                             not in unavailable_keys]
             new_unique = _dedupe_evidence(new_evidence)
             inherited_keys = {(e['source_id'], e['version'], e['quote']) for e in inherited}
             fresh = [e for e in new_unique

@@ -23,8 +23,8 @@ def claim(engine,lease):
     db=engine.db;now=time.time()
     db.execute('BEGIN IMMEDIATE')
     try:
-        db.execute("UPDATE jobs SET state='failed',error='retry budget exhausted' WHERE attempts>=3 AND (state='pending' OR (state='running' AND lease_until<?))",(now,))
-        row=db.execute("SELECT * FROM jobs WHERE attempts<3 AND (state='pending' OR (state='running' AND lease_until<?) OR (state='retry' AND lease_until<?)) ORDER BY created_at LIMIT 1",(now,now)).fetchone()
+        db.execute("UPDATE jobs SET state='failed',error='retry budget exhausted' WHERE tongle_source_process(source_id,version) AND attempts>=3 AND (state='pending' OR (state='running' AND lease_until<?))",(now,))
+        row=db.execute("SELECT * FROM jobs WHERE tongle_source_process(source_id,version) AND attempts<3 AND (state='pending' OR (state='running' AND lease_until<?) OR (state='retry' AND lease_until<?)) ORDER BY created_at LIMIT 1",(now,now)).fetchone()
         if not row:db.commit();return None
         token=uuid.uuid4().hex
         db.execute("UPDATE jobs SET state='running',attempts=attempts+1,lease_until=?,lease_token=?,error=NULL WHERE id=?",(now+lease,token,row['id']))
@@ -40,24 +40,20 @@ def extraction_prompt(source):
 
 def invoke_json(command,prompt,timeout,env=None):
     if not isinstance(command,list) or not command or not all(isinstance(x,str) for x in command):raise ValueError('model_command must be argv array')
-    from .portability import process_options, terminate_tree
-    child_env=dict(env) if env is not None else dict(os.environ)
-    child_env['PYTHONUTF8']='1'
-    child_env['PYTHONIOENCODING']='utf-8'
     process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                             text=True,encoding='utf-8',env=child_env,**process_options(detached=True))
+                             text=True,start_new_session=True,env=env)
     def terminate(signum,frame):
-        terminate_tree(process)
+        if process.poll() is None:os.killpg(process.pid,signal.SIGTERM)
         raise SystemExit(128+signum)
     previous=signal.signal(signal.SIGTERM,terminate)
     out=err=''
     try:
         try:out,err=process.communicate(prompt,timeout=timeout)
         except subprocess.TimeoutExpired:
-            terminate_tree(process)
+            os.killpg(process.pid,signal.SIGTERM)
             try:out,err=process.communicate(timeout=3)
             except subprocess.TimeoutExpired:
-                terminate_tree(process,force=True)
+                os.killpg(process.pid,signal.SIGKILL)
                 out,err=process.communicate()
             usage=_observed_usage(err)
             raise ModelError('timeout',code='timeout',usage=usage)
@@ -173,7 +169,7 @@ def process_jobs(engine,limit=5):
     if enabled(engine):return Evolution(engine).process(limit)
     prepare(engine)
     config_path=engine.home/'config.json'
-    cfg=json.loads(config_path.read_text(encoding='utf-8')) if config_path.exists() else {}
+    cfg=json.loads(config_path.read_text()) if config_path.exists() else {}
     command=cfg.get('model_command')
     if not command:return {'processed':0,'failed':0,'disabled':True,'pending':engine.store.status()['jobs'].get('pending',0)}
     timeout=min(600,max(1,float(cfg.get('model_timeout_seconds',180))))

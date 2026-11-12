@@ -26,6 +26,7 @@ import time
 from .evolution import (BudgetWait, CoverageWait, SelectionChanged, StageLimit,
                         _TRANSIENT_CATEGORIES, _int_or, canonical, fingerprint)
 from .model_errors import ModelError
+from .triage import CAPACITY, CONTENT, classify
 
 # The existing v5 contract label and the isolated v2 pipeline label. These are
 # the only two protocols any queue/lease code may act on.
@@ -128,6 +129,8 @@ def queue_events(evo, cfg, force, now):
     for row in evo.db.execute(
             'SELECT id,project,session,kind,created_at FROM sources'
             ' ORDER BY created_at,id').fetchall():
+        from .memory_runtime import source_allowed
+        if not source_allowed(evo.engine,row['id']): continue
         resolved = _eligible_source(evo, row)
         if resolved is None:
             continue
@@ -135,11 +138,33 @@ def queue_events(evo, cfg, force, now):
         eligible.append((row, source, parts))
 
     eligible_ids = sorted({row['id'] for row, _source, _parts in eligible})
+    # Assistant reports are evidence/report material, not user decisions. They
+    # are curated only for explicitly opted-in projects; elsewhere they stay
+    # raw and searchable. This prevents long AI reports from becoming a new
+    # oversized card every session, which was the dominant content-failure
+    # source in 2026-10.
+    assistant_projects = cfg.get('knowledge_assistant_curation_projects')
+    if assistant_projects is None:
+        # Backward compatible: no policy configured means curate both roles.
+        assistant_all, assistant_projects = True, set()
+    elif isinstance(assistant_projects, list):
+        assistant_all = '*' in assistant_projects
+        assistant_projects = {p for p in assistant_projects if isinstance(p, str)}
+    else:
+        # A malformed policy must not silently disable assistant curation.
+        assistant_all, assistant_projects = True, set()
 
     # One earliest new event per project/session per cycle. The rest remain
     # eligible (and are rediscovered next cycle); they are never marked seen.
+    skipped_ids = []
     chosen = {}
     for row, source, parts in eligible:
+        if (source.get('role') == 'assistant' and not assistant_all
+                and row['project'] not in assistant_projects):
+            # Keep it in ``eligible``/``skipped`` so the legacy grouping cannot
+            # silently steal it into a v5 batch instead.
+            skipped_ids.append(row['id'])
+            continue
         key = (row['project'], row['session'])
         current = chosen.get(key)
         if (current is None
@@ -148,7 +173,6 @@ def queue_events(evo, cfg, force, now):
             chosen[key] = (row, source, parts)
 
     queued_ids = []
-    skipped_ids = []
     for key in sorted(chosen, key=lambda k: (str(k[0]), str(k[1]))):
         row, source, parts = chosen[key]
         session = row['session']
@@ -191,6 +215,15 @@ def _handle_error(evo, job, token, cfg, exc):
     The bundle, proposal, review, call ledger and audit rows are all left
     exactly as the execution layer wrote them. Only the work state/error is
     changed, and only while this worker still owns the live running lease.
+
+    A ``failed`` row deliberately KEEPS its frozen bundle: the operator
+    completion path re-derives the original frozen window reference parts from
+    it (``delta_operator._frozen_window_reference_parts``). A *resumable*
+    outcome (``retry``/``budget_wait``/``publication_pending``) keeps the cache
+    for the same reason. Dead payloads on an obsoleted row are therefore not
+    erased here -- that is deliberately deferred to the bounded reclamation
+    sweep (``tongle/reclaim.py``), which leaves this audited write with every
+    column byte-identical.
     """
     work_id = job['id']
     error = _safe_error(exc)
@@ -266,6 +299,22 @@ def _handle_error(evo, job, token, cfg, exc):
                 "UPDATE knowledge_work SET state=?,error=?,next_at=?"
                 " WHERE id=? AND lease_token=? AND state='running'",
                 (state, error, next_at, work_id, token))
+        if state == 'failed':
+            evo.db.execute("UPDATE knowledge_work SET lease_token=NULL,lease_until=0 "
+                           "WHERE id=? AND lease_token=? AND state='failed' "
+                           "AND NOT EXISTS (SELECT 1 FROM knowledge_calls WHERE work_id=? AND elapsed IS NULL)",
+                           (work_id, token, work_id))
+            # Same rule as the v5 terminal path: a content/capacity rejection is
+            # an explicit parked decision, not a permanent per-session alarm.
+            # Unknown/programming errors stay visible.
+            category = classify(error)
+            if category in (CONTENT, CAPACITY):
+                evo.db.execute(
+                    'INSERT OR REPLACE INTO knowledge_triage'
+                    '(work_id,class,action,note,actor,created_at) VALUES(?,?,?,?,?,?)',
+                    (work_id, category, 'parked',
+                     'terminal content/capacity failure; not retried blindly',
+                     'auto-park', time.time()))
         if audit:
             evo.db.execute(
                 'INSERT INTO knowledge_failures(work_id,state,error,created_at)'
