@@ -1,3 +1,5 @@
+> **当前下载** [Tongle 0.4.1 安装预览](https://github.com/sishuai33-commits/tongle-next/releases/tag/v0.4.1-preview.1) · [新版快速开始](https://github.com/sishuai33-commits/tongle-next/blob/v0.4.1-preview.1/docs/friend-quickstart.md)。本页其余说明对应旧版 0.2.0。
+
 <div align="center">
 
 # Tongle · 童乐

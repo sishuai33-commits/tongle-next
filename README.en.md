@@ -1,3 +1,5 @@
+> **Current download** [Tongle 0.4.1 installation preview](https://github.com/sishuai33-commits/tongle-next/releases/tag/v0.4.1-preview.1) · [New quick start in Chinese](https://github.com/sishuai33-commits/tongle-next/blob/v0.4.1-preview.1/docs/friend-quickstart.md). The rest of this page describes version 0.2.0.
+
 # Tongle
 
 **Keep your knowledge up to date with what you learn.**
